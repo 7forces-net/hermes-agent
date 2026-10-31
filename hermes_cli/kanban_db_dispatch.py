@@ -1019,7 +1019,14 @@ def _classify_dead_worker_exit(pid: int, claimer: Optional[str]) -> _DeadWorker:
             # ``protocol_violation`` is the durable marker for
             # _protocol_violation_streak: _end_run copies this payload into the
             # run metadata.
-            {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
+            #
+            # ``exit_code``/``exit_kind`` name HOW the worker ended (rc=0 =
+            # exited cleanly without reporting a result). The notifiers read
+            # ``protocol_violation`` to say "it exited without reporting a
+            # result" instead of the generic "its worker stopped
+            # unexpectedly", and ``pid``/``claimer`` stay out of the message.
+            {"pid": pid, "claimer": claimer, "exit_code": code,
+             "exit_kind": kind, "protocol_violation": True},
             protocol_violation=True,
         )
     if kind == "rate_limited":

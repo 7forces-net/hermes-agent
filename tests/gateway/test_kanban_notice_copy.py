@@ -36,3 +36,26 @@ def test_crashed_and_timed_out_say_retry_and_hide_internals():
         assert "retried automatically" in msg
         assert "pid" not in msg and "max_runtime" not in msg
     assert "30-minute" in timed_out
+
+
+def test_protocol_violation_names_the_real_cause_and_hides_internals():
+    """A protocol violation is not a random crash — say so, and hide the pid.
+
+    The worker exited cleanly (rc=0) while the task was still ``running``: it
+    never reported a result. "stopped unexpectedly" hides that the worker
+    misbehaved, which is the whole reason the event exists.
+    """
+    msg, _wake, _reason = _EVENT_FORMATTERS["protocol_violation"](
+        _event(pid=4242, claimer="host:1", exit_code=0,
+               exit_kind="clean_exit", protocol_violation=True),
+        _names(),
+    )
+    assert "without reporting a result" in msg
+    assert "retried automatically" in msg
+    # The internals stay hidden: a pid is noise to a human reader.
+    assert "4242" not in msg
+    assert "host:1" not in msg
+    assert "claimer" not in msg
+    assert "pid" not in msg
+    # It must not borrow the generic crash wording.
+    assert "stopped unexpectedly" not in msg

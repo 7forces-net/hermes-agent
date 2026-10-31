@@ -142,7 +142,9 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+# ``protocol_violation`` is the reaper's clean-exit crash: it was emitted but never claimed, so a worker that
+# exited without reporting a result stranded the task with no notification at all.
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "protocol_violation")
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0  # /loop and /heartbeat share one idle-poll cadence
 
 
@@ -357,6 +359,22 @@ def _kb_timed_out(task, payload: dict, title: str) -> str:
     return " timed out (unknown cause; will retry)"
 
 
+def _kb_protocol_violation(task, payload: dict, title: str) -> str:
+    """Name the REAL cause of a protocol-violation crash.
+
+    A protocol violation is NOT a random crash: the worker exited cleanly
+    (rc=0) while the task was still ``running`` — it finished (or died) but
+    never called ``kanban_complete``/``kanban_block``, so the task has no
+    verdict. "worker crashed (pid gone)" hides that the worker misbehaved
+    rather than crashed, and it leaks the pid vocabulary the gateway copy
+    deliberately keeps out of the reader's face.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    streak = _kb_int(payload.get("protocol_violations"))
+    streak_text = f" after {streak} protocol violations" if streak and streak > 1 else ""
+    return f" worker exited without reporting a result{streak_text}; dispatcher will retry"
+
+
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
 _KANBAN_EVENT_FORMATTERS = {
     "completed": ("✔", _kb_completed),
@@ -364,6 +382,7 @@ _KANBAN_EVENT_FORMATTERS = {
     "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
                 + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
     "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
+    "protocol_violation": ("✖", _kb_protocol_violation),
     "timed_out": ("⏱", _kb_timed_out),
     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
 }

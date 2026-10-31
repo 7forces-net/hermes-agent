@@ -39,10 +39,17 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+# ``protocol_violation`` is the reaper's clean-exit crash (a worker that
+# exited rc=0 while still ``running`` — it did the work but never reported
+# a result). It was emitted but NOT claimed here, so the transition that
+# strands a task produced zero notification and the task stalled silently —
+# the same shape as the ``block_loop_detected`` gap fixed in PR #62712.
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "protocol_violation")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+# ``protocol_violation`` wakes the origin: the task is stuck with no verdict
+# and only a human (or the origin) can decide what to do about it.
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "protocol_violation")
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -460,6 +467,32 @@ def _fmt_timed_out(ev, n) -> tuple:
     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
 
 
+def _fmt_protocol_violation(ev, n) -> tuple:
+    """Name the REAL cause of a protocol-violation crash.
+
+    A protocol violation is NOT a random crash: the worker exited cleanly
+    (rc=0) while the task was still ``running`` — it finished (or died) but
+    never called ``kanban_complete``/``kanban_block``, so the task has no
+    verdict. Saying "its worker stopped unexpectedly" hides that the worker
+    misbehaved rather than crashed, which is the whole point of the event.
+
+    The violation streak (``protocol_violations``) is carried on the
+    ``gave_up`` event that trips the budget, not on this one, so the count
+    is read when present and omitted when it is not. ``pid``/``claimer``
+    stay hidden: a pid is noise to a human reader.
+    """
+    streak = _payload_int(ev, "protocol_violations")
+    if streak and streak > 1:
+        streak_text = f" after {streak} protocol violations"
+    else:
+        streak_text = ""
+    return (
+        f"✖ {n.head} — its worker exited without reporting a result"
+        f"{streak_text}; it will be retried automatically.",
+        None, None,
+    )
+
+
 # archived / unblocked are claimed (so the cursor advances past them) but
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
@@ -470,6 +503,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "crashed": lambda ev, n: (
         f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
     ),
+    "protocol_violation": _fmt_protocol_violation,
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
