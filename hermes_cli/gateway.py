@@ -1020,7 +1020,27 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         # HERMES_HOME) the windowless base interpreter needs to import hermes_cli. Empty on POSIX.
         if _respawn_cwd:
             _popen_kwargs["cwd"] = _respawn_cwd
-        _base_env = {{**os.environ, **_respawn_env_overlay}}
+        # A gateway is the top-level control plane, NOT a delegate_task child: it OWNS
+        # the boards and must be able to mutate them. ``os.environ`` here is the
+        # environment of whatever CLI asked for the restart — and when that CLI was a
+        # delegate child (a kanban worker restarting the gateway), the delegation
+        # fence rode along. A fenced gateway refused every write_txn on its own board,
+        # and because the reclaim phase runs FIRST in the dispatch tick, the tick
+        # aborted before the spawn phase: no ready card was ever dispatched, on any
+        # board, with only one log line to show for it.
+        #
+        # Strip the fence marker (REMOVE it — an empty value would still read as a
+        # present marker, and the legacy "1" value fences everything) and the worker
+        # board pins (HERMES_KANBAN_DB pins EVERY board slug to one DB, so an
+        # inherited pin makes the gateway dispatch the wrong board's cards).
+        # Do NOT use ``scrub_kanban_env``: that helper PRESERVES an inherited fence
+        # for descendants, which is the opposite of what a gateway respawn needs.
+        _base_env = {{k: v for k, v in os.environ.items()
+                     if k not in ("HERMES_DELEGATED_CHILD_CONTEXT",
+                                  "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                                  "HERMES_KANBAN_WORKSPACES_ROOT",
+                                  "HERMES_KANBAN_WORKSPACE")}}
+        _base_env.update(_respawn_env_overlay)
         try:
             if sys.platform == "win32":
                 try:
@@ -1037,8 +1057,9 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
                     _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}}
                     subprocess.Popen(cmd, **_popen_kwargs)
             else:
-                if _respawn_env_overlay:
-                    _popen_kwargs["env"] = _base_env
+                # Always pass the scrubbed env: without an overlay the child would
+                # inherit the watcher's environment wholesale, fence marker included.
+                _popen_kwargs["env"] = _base_env
                 _popen_kwargs["start_new_session"] = True
                 subprocess.Popen(cmd, **_popen_kwargs)
         finally:
@@ -3804,10 +3825,16 @@ def _spawn_detached_gateway() -> bool:
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
+        # Control-plane env: strip the delegation fence and the worker board
+        # pins this CLI inherited. A gateway that inherits them is fenced (every
+        # board write refused) and pinned to one board, so its dispatcher either
+        # stops dispatching or dispatches the wrong board's cards.
+        from agent.delegation_context import control_plane_env
         with open(log_dir / "gateway.log", "ab") as out:
             subprocess.Popen(
                 _timestamped_stderr_gateway_command(log_dir / "gateway.error.log"),
                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                env=control_plane_env(os.environ),
                 **windows_detach_popen_kwargs(),
             )
     except OSError:

@@ -24,6 +24,14 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
 )
 
+# Board-LOCATION pins, as opposed to worker IDENTITY. A worker is pinned to ONE
+# board so it cannot see the others; a control plane (the gateway) dispatches
+# EVERY board, so inheriting these makes it resolve every slug to the pinned DB.
+KANBAN_BOARD_PIN_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_WORKSPACE",
+)
+
 
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
@@ -104,6 +112,66 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
     cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+    return cleaned
+
+
+def strip_delegation_fence(
+    env: Mapping[str, str] | MutableMapping[str, str],
+) -> dict[str, str]:
+    """Return a copy of *env* with the delegation fence REMOVED.
+
+    The opposite of :func:`scrub_kanban_env`: that helper PRESERVES an inherited
+    fence (it re-stamps the current root), which is right for a delegate_task
+    descendant and wrong for a gateway. A gateway is the top-level control plane,
+    not a delegate child — it OWNS the boards and must be able to mutate them.
+
+    A gateway respawn inherits ``os.environ`` verbatim from whatever CLI asked
+    for the restart. When that CLI was a ``delegate_task`` child (a kanban
+    worker restarting the gateway), the fence marker rode along into the new
+    gateway. The gateway then treated its own board DB as a descendant's
+    read-only target: every ``write_txn`` was refused, and because the reclaim
+    phase runs FIRST in the dispatch tick, the tick aborted before the spawn
+    phase — so no ready card was ever dispatched, on any board.
+
+    The marker is removed (not blanked): an empty value would still be a
+    present-but-empty marker, and ``kanban_path_is_fenced`` treats a legacy
+    ``"1"`` as "fence everything". Callers pass the marker through
+    :func:`strip_delegation_fence` on every path that spawns a gateway.
+
+    Only the fence marker is touched. ``HERMES_KANBAN_DB`` and friends are
+    board PINNING, not identity: a gateway that inherited them would resolve
+    every board slug to the pinned DB (see ``_board_path``), so those are
+    stripped by the caller when the spawn targets the control plane.
+    """
+    cleaned = dict(env)
+    cleaned.pop(DELEGATED_CHILD_ENV_MARKER, None)
+    return cleaned
+
+
+def control_plane_env(
+    env: Mapping[str, str] | MutableMapping[str, str],
+) -> dict[str, str]:
+    """Return a copy of *env* suitable for spawning a CONTROL PLANE process.
+
+    Strips two classes of inherited Kanban env:
+
+    1. The delegation fence (:func:`strip_delegation_fence`). A control plane
+       is not a delegate child; it owns the boards and must be able to mutate
+       them.
+    2. Worker board-LOCATION pins (``HERMES_KANBAN_DB`` and friends). These
+       pin a worker to ONE board so it cannot see the others — but
+       ``_board_path`` consults ``HERMES_KANBAN_DB`` BEFORE the ``board=``
+       argument, so a control plane that inherited the pin resolves EVERY
+       board slug to that one DB. The gateway dispatches all boards, so an
+       inherited pin makes it dispatch the wrong board's cards (and, on a
+       fenced board, no cards at all).
+
+    ``HERMES_KANBAN_BOARD`` is cleared too: ``get_current_board`` reads it as
+    the active-board override, and the gateway enumerates boards itself.
+    """
+    cleaned = strip_delegation_fence(env)
+    for key in KANBAN_BOARD_PIN_ENV_KEYS:
+        cleaned.pop(key, None)
     return cleaned
 
 

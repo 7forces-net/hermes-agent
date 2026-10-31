@@ -1283,12 +1283,23 @@ class GatewayShutdownMixin:
     # Restart orchestration
     @staticmethod
     def _restart_watcher_env() -> dict:
-        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down)."""
+        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down).
+
+        Also minus the delegation fence marker and the worker board pins: this env
+        becomes the restarted gateway's environment, and a gateway is the
+        top-level control plane that OWNS every board. A fence inherited here
+        makes the new gateway refuse every board write, and since the dispatch
+        tick's reclaim phase runs first and raises on a fenced board, the tick
+        aborts before spawning — no ready card is ever dispatched, on any
+        board. An inherited ``HERMES_KANBAN_DB`` pin makes every board slug
+        resolve to that one DB, so the gateway dispatches the wrong board.
+        """
+        from agent.delegation_context import control_plane_env
         from gateway.config_loader import drop_bridged_env
         from tools.environments.local import build_subprocess_env
         watcher_env = drop_bridged_env(build_subprocess_env(scrub_secrets=False, inherit_profile_home=True))
         watcher_env.pop("_HERMES_GATEWAY", None)
-        return watcher_env
+        return control_plane_env(watcher_env)
 
     @staticmethod
     def _spawn_windows_restart_watcher(hermes_cmd: list, current_pid: int, restart_after_s: float) -> None:

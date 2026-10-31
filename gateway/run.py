@@ -5262,6 +5262,32 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
 
+    # The gateway is the top-level control plane, NOT a delegate_task child: it
+    # OWNS the boards and must be able to mutate them. A gateway process can
+    # inherit the delegation fence from whatever CLI spawned it — a
+    # ``delegate_task`` child (a kanban worker restarting the gateway) copies
+    # ``os.environ`` wholesale into the respawn, carrying the marker along.
+    #
+    # A fenced gateway refuses every write_txn on its own board, and because the
+    # dispatch tick's reclaim phase runs FIRST and raises on a fenced board,
+    # the tick aborts before the spawn phase: no ready card is ever dispatched,
+    # on any board, with only one log line to show for it.
+    #
+    # The worker board pins are dropped for the same reason: ``HERMES_KANBAN_DB``
+    # is consulted BEFORE the ``board=`` argument, so an inherited pin makes
+    # every board slug resolve to that one DB — the gateway would dispatch the
+    # wrong board's cards.
+    #
+    # This is the authoritative in-process guard. The spawn paths strip the same
+    # keys before spawning (so the child never sees them), but a gateway can
+    # also be started in-process — ``hermes gateway run`` from a delegate child,
+    # or the service manager's own exec — and this covers every entry point.
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER, KANBAN_BOARD_PIN_ENV_KEYS,
+    )
+    for _key in (DELEGATED_CHILD_ENV_MARKER, *KANBAN_BOARD_PIN_ENV_KEYS):
+        os.environ.pop(_key, None)
+
     from hermes_cli.resource_limits import apply_nofile_soft_limit
     apply_nofile_soft_limit()
 

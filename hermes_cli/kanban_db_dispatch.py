@@ -2083,10 +2083,27 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
-    _run_reclaim_phase(
-        conn, result, stale_timeout_seconds=stale_timeout_seconds,
-        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
-    )
+    # The reclaim phase MUST NOT be able to stop dispatching. It runs first, so
+    # any exception it raises aborts the tick BEFORE the spawn phase — and the
+    # only outward signal is one log line, so the board silently stops
+    # dispatching forever. That is exactly how a fenced gateway (a leaked
+    # HERMES_DELEGATED_CHILD_CONTEXT made every write_txn on the board raise
+    # PermissionError) left ready cards unspawned on every board.
+    #
+    # Fail OPEN: log the failure and continue to the spawn phase. A broken
+    # reclaim means stale/crashed tasks are not reclaimed THIS tick — degraded
+    # bookkeeping, not a dead dispatcher.
+    try:
+        _run_reclaim_phase(
+            conn, result, stale_timeout_seconds=stale_timeout_seconds,
+            failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        )
+    except Exception as exc:
+        _kb._log.exception(
+            "kanban dispatch: reclaim phase failed on board %s (%s: %s); "
+            "continuing to the spawn phase — stale/crashed tasks are not reclaimed this tick",
+            board or _kb.DEFAULT_BOARD, type(exc).__name__, exc,
+        )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )

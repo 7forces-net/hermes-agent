@@ -635,7 +635,22 @@ def _spawn_detached(script_path: Path | None = None, home: Path | None = None) -
     """
     _assert_windows()
     argv, working_dir, env_overlay = _build_gateway_argv(home)
-    env = {**os.environ, **env_overlay}
+    # A gateway is the top-level control plane, NOT a delegate_task child: it OWNS
+    # the boards and must be able to mutate them. ``os.environ`` here belongs to
+    # whatever CLI asked for the start — and when that CLI was a delegate child
+    # (a kanban worker restarting the gateway), the delegation fence rode along.
+    # A fenced gateway refused every write_txn on its own board, and because the
+    # reclaim phase runs FIRST in the dispatch tick, the tick aborted before the
+    # spawn phase: no ready card was ever dispatched, on any board.
+    #
+    # Strip the fence marker (REMOVE it — an empty value would still read as a
+    # present marker, and the legacy "1" value fences everything) and the worker
+    # board pins (HERMES_KANBAN_DB pins EVERY board slug to one DB, so an
+    # inherited pin makes the gateway dispatch the wrong board's cards).
+    # Do NOT use ``scrub_kanban_env``: that helper PRESERVES an inherited fence
+    # for descendants, which is the opposite of what a gateway spawn needs.
+    from agent.delegation_context import control_plane_env
+    env = {**control_plane_env(os.environ), **env_overlay}
 
     # Stray print()/native stderr goes to a sidecar log; real gateway logs still land in gateway.log
     # via the logging FileHandler.
