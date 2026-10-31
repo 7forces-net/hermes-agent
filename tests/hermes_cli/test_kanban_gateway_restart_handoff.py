@@ -61,6 +61,11 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     class FakeProc:
         pid = 4242
 
+        def poll(self):
+            # The Windows reaper polls the handles _default_spawn parks; this
+            # double stands for a live worker, so report "still running".
+            return None
+
     def fake_popen(cmd, **kwargs):
         nonlocal captured_cwd
         captured_cmd.extend(cmd)
@@ -129,6 +134,11 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
 
     class FakeProc:
         pid = 4243
+
+        def poll(self):
+            # The Windows reaper polls the handles _default_spawn parks; this
+            # double stands for a live worker, so report "still running".
+            return None
 
     monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: captured_cmd.extend(cmd) or FakeProc())
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)

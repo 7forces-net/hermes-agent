@@ -714,6 +714,11 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         def __init__(self):
             self.pid = 99999
 
+        def poll(self):
+            # The Windows reaper polls the handles _default_spawn parks; this
+            # double stands for a live worker, so report "still running".
+            return None
+
     def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env", {})

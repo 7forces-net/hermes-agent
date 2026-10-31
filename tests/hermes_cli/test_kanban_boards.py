@@ -251,6 +251,11 @@ class TestWorkerSpawnEnv:
         class FakeProc:
             pid = 12345
 
+            def poll(self):
+                # The Windows reaper polls the handles _default_spawn parks;
+                # this double stands for a live worker ("still running").
+                return None
+
         def fake_popen(cmd, *args, **kwargs):
             captured["cmd"] = cmd
             captured["env"] = kwargs.get("env", {})

@@ -69,6 +69,11 @@ agent:
     class FakeProc:
         pid = 4242
 
+        def poll(self):
+            # The Windows reaper polls the handles _default_spawn parks; this
+            # double stands for a live worker, so report "still running".
+            return None
+
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
@@ -111,6 +116,11 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     class FakeProc:
         pid = 4244
+
+        def poll(self):
+            # The Windows reaper polls the handles _default_spawn parks; this
+            # double stands for a live worker, so report "still running".
+            return None
 
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
@@ -161,6 +171,11 @@ def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp
 
     class FakeProc:
         pid = 4243
+
+        def poll(self):
+            # The Windows reaper polls the handles _default_spawn parks; this
+            # double stands for a live worker, so report "still running".
+            return None
 
     def fake_popen(cmd, *args, **kwargs):
         captured["env"] = dict(kwargs.get("env") or {})

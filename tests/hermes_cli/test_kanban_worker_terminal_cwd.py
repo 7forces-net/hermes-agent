@@ -47,6 +47,11 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
     class FakeProc:
         pid = 4242
 
+        def poll(self):
+            # The Windows reaper polls the handles _default_spawn parks; this
+            # double stands for a live worker, so report "still running".
+            return None
+
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
