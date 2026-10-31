@@ -17,7 +17,12 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
-from hermes_cli.kanban_notice import gave_up_cause
+from hermes_cli.kanban_notice import (
+    clip_worker_output,
+    crashed_cause,
+    gave_up_cause,
+    reclaimed_cause,
+)
 
 # Legacy ``timed_out`` events (written before the producer carried the cause
 # keys) name the iteration budget only in their error text:
@@ -45,12 +50,21 @@ def _kbn():
 # a result). It was emitted but NOT claimed here, so the transition that
 # strands a task produced zero notification and the task stalled silently —
 # the same shape as the ``block_loop_detected`` gap fixed in PR #62712.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "protocol_violation")
+# ``reclaimed`` is the stale-claim reclaim: the dispatcher's watchdog took
+# the task back because the worker's claim went stale (or a human reclaimed
+# it). It was in NEITHER list, so a task that hung for 2.6 hours and was then
+# reclaimed produced ZERO notification — the same silent-stall shape
+# ``t_f4c4ba10`` fixed for ``protocol_violation``, one event kind over. It
+# SHOULD wake the origin: a reclaimed task is requeued, but a human may want
+# to know the task was hanging.
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "protocol_violation", "reclaimed")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 # ``protocol_violation`` wakes the origin: the task is stuck with no verdict
 # and only a human (or the origin) can decide what to do about it.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "protocol_violation")
+# ``reclaimed`` wakes the origin for the same reason: the worker hung and
+# the dispatcher took the task back.
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "protocol_violation", "reclaimed")
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -520,6 +534,66 @@ def _fmt_protocol_violation(ev, n) -> tuple:
     )
 
 
+def _fmt_crashed(ev, n) -> tuple:
+    """Name the REAL cause of an ordinary crash.
+
+    The copy used to say "its worker stopped unexpectedly" for every crash.
+    That is the generic fallback you write when you know nothing — and the
+    board knows several concrete things at crash time. The reaper classifies
+    the death and puts the classification on the payload as
+    ``exit_kind``/``exit_code``:
+
+      * ``nonzero_exit`` -> the worker exited with a non-zero code;
+      * ``signaled``     -> it was killed by a signal;
+      * ``clean_exit``   -> it exited cleanly WITHOUT reporting a result,
+                           which is a protocol violation and must not be
+                           called a random crash;
+      * ``rate_limited`` -> a quota wall, which is NOT a failure at all;
+      * ``unknown``      -> the pid was absent from the exit registry, so
+                           the board genuinely does not know how it died.
+
+    ``crashed_cause`` owns the wording so the gateway and the TUI cannot
+    drift apart again. It names a cause only when the payload carries one:
+    no cause key -> the cause is unknown, never invented.
+
+    The worker's own last words stay OUT of the message. ``worker_output``
+    is raw worker output (thousands of chars, full of ANSI); it stays in the
+    payload and the log, and the message points at ``hermes kanban log``.
+    ``pid``/``claimer`` stay hidden: a pid is noise to a human reader.
+    """
+    payload = _payload_dict(ev)
+    cause = crashed_cause(payload)
+    excerpt = clip_worker_output(payload)
+    detail = f" (last words: {excerpt})" if excerpt else ""
+    return (
+        f"✖ {n.head} — {cause}; it will be retried automatically.{detail} "
+        f"Logs: `hermes kanban log {n.task_id}`.",
+        None, None,
+    )
+
+
+def _fmt_reclaimed(ev, n) -> tuple:
+    """Name the REAL cause of a stale-claim reclaim.
+
+    A reclaim means the dispatcher's watchdog took the task back: the
+    worker's claim went stale, or a human reclaimed it. The event was in no
+    subscriber's kind list, so this transition produced ZERO notification and
+    a task that hung for 2.6 hours vanished silently.
+
+    ``reclaimed_cause`` owns the wording so the gateway and the TUI cannot
+    drift apart again. It names the reclaim reason when the payload carries
+    one ("watchdog: hard reclaim of stuck task (running 2.1h with no
+    completion)") and describes the reclaim truthfully when it does not.
+    """
+    payload = _payload_dict(ev)
+    cause = reclaimed_cause(payload)
+    return (
+        f"♻ {n.head} — {cause}; it was requeued and will be retried automatically. "
+        f"Logs: `hermes kanban log {n.task_id}`.",
+        None, None,
+    )
+
+
 # archived / unblocked are claimed (so the cursor advances past them) but
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
@@ -527,9 +601,8 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": _fmt_gave_up,
-    "crashed": lambda ev, n: (
-        f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
-    ),
+    "crashed": _fmt_crashed,
+    "reclaimed": _fmt_reclaimed,
     "protocol_violation": _fmt_protocol_violation,
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),

@@ -175,6 +175,7 @@ gateway:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"
       crashed:             "crashed (worker exited); dispatcher will retry"
+      reclaimed:           "已重新領取（worker 聲明過期），dispatcher 將重試"
       protocol_violation: "退出前未回報結果，dispatcher 將重試"
       timed_out:           "timed out; dispatcher will retry"
       blocked:             "blocked; needs attention"

@@ -324,9 +324,11 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # First crash delivered.
+    # First crash delivered. The event carries no exit keys (the test appends
+    # a bare ``crashed`` event), so the message must say the cause is
+    # UNKNOWN rather than inventing an exit code.
     assert len(adapter.sent) == 1
-    assert "stopped unexpectedly" in adapter.sent[0]["text"].lower()
+    assert "cause is unknown" in adapter.sent[0]["text"].lower()
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -354,7 +356,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"Second crashed event should also notify; got {len(adapter.sent)} "
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
-    assert "stopped unexpectedly" in adapter.sent[1]["text"].lower()
+    assert "cause is unknown" in adapter.sent[1]["text"].lower()
 
 
 def test_notifier_subscription_survives_done_reopen_until_archive(

@@ -175,6 +175,7 @@ gateway:
       completed:           "已完成"
       gave_up:             "已放弃（重试次数耗尽）"
       crashed:             "崩溃（worker 异常退出），dispatcher 将重试"
+      reclaimed:           "已重新领取（worker 声明过期），dispatcher 将重试"
       protocol_violation: "退出前未报告结果，dispatcher 将重试"
       timed_out:           "超时，dispatcher 将重试"
       blocked:             "被阻塞，需要处理"

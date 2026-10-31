@@ -394,19 +394,27 @@ def test_tui_names_the_protocol_violation_cause():
 
 
 def test_the_generic_crash_message_is_unchanged():
-    """The control: an ordinary crash keeps its existing wording.
+    """The control: an ordinary crash keeps its OWN wording.
 
     The protocol-violation branch must not have swallowed the generic crash
-    copy — a plain crash still says the worker stopped unexpectedly.
+    copy — a plain crash must still be announced as a crash, in its own
+    words, and must not borrow the violation wording.
+
+    The wording itself changed under the crash-cause card: a plain crash now
+    says the cause is UNKNOWN (the payload carries no exit keys, so the board
+    genuinely does not know how the worker died) instead of the old "its
+    worker stopped unexpectedly". What this control protects is unchanged:
+    the plain crash and the protocol violation are still DIFFERENT messages.
     """
     gateway_msg = _gateway_msg("crashed", {"pid": 4242, "claimer": "host:1"})
-    assert "stopped unexpectedly" in gateway_msg
+    assert "cause is unknown" in gateway_msg
     assert "retried automatically" in gateway_msg
     assert "without reporting a result" not in gateway_msg
 
     tui_text = _tui_text("crashed", {"pid": 4242, "claimer": "host:1"})
-    assert "crashed" in tui_text
+    assert "cause is unknown" in tui_text
     assert "will retry" in tui_text
+    assert "without reporting a result" not in tui_text
 
 
 def test_a_crash_without_violation_keys_never_mentions_violations():
