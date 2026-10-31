@@ -8,6 +8,7 @@ import contextlib
 import re
 
 from .method_ctx import bind_module
+from hermes_cli.kanban_notice import gave_up_cause as _gave_up_cause
 
 # Legacy ``timed_out`` events (written before the producer carried the cause
 # keys) name the iteration budget only in their error text:
@@ -375,12 +376,32 @@ def _kb_protocol_violation(task, payload: dict, title: str) -> str:
     return f" worker exited without reporting a result{streak_text}; dispatcher will retry"
 
 
+def _kb_gave_up(task, payload: dict, title: str) -> str:
+    """Name the REAL cause of the breaker trip.
+
+    This copy used to be hardcoded to "gave up after repeated spawn failures",
+    which is wrong for EVERY trigger except ``spawn_failed`` — a
+    crash-triggered or timeout-triggered trip both hit it and were told they
+    were spawn failures. It now reads the payload like the gateway copy does,
+    so the two cannot drift apart again.
+
+    The unified ``failures`` counter is deliberately NOT quoted as the cause:
+    a protocol-violation trip does not tick it, so the number would describe
+    a different budget than the one that tripped (the same false-cause class
+    as ``t_94a810ea``'s "max_runtime=0s"). See
+    ``hermes_cli/kanban_notice.py`` for the shared wording.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    cause = _gave_up_cause(payload)
+    err = str(payload.get("error"))[:200] if payload.get("error") else ""
+    return f" gave up — {cause}" + (f"\n{err}" if err else "")
+
+
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
 _KANBAN_EVENT_FORMATTERS = {
     "completed": ("✔", _kb_completed),
     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
-    "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
-                + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
+    "gave_up": ("✖", _kb_gave_up),
     "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
     "protocol_violation": ("✖", _kb_protocol_violation),
     "timed_out": ("⏱", _kb_timed_out),

@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
+from hermes_cli.kanban_notice import gave_up_cause
 
 # Legacy ``timed_out`` events (written before the producer carried the cause
 # keys) name the iteration budget only in their error text:
@@ -330,6 +331,16 @@ def _payload(ev: Any, key: str) -> Any:
     return ev.payload.get(key) if ev.payload and ev.payload.get(key) else None
 
 
+def _payload_dict(ev: Any) -> dict:
+    """The event payload as a dict; ``{}`` when absent or not a mapping.
+
+    A malformed payload must never make a renderer raise — every renderer
+    reads the payload defensively.
+    """
+    payload = getattr(ev, "payload", None)
+    return payload if isinstance(payload, dict) else {}
+
+
 def _payload_int(ev: Any, key: str) -> Optional[int]:
     """Shared payload read coerced to int; None when missing or not numeric.
 
@@ -418,13 +429,29 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
 
 
 def _fmt_gave_up(ev, n) -> tuple:
-    # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
-    # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
-    failures = _payload(ev, "failures")
-    count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
+    """Name the REAL cause of the breaker trip.
+
+    The dispatcher auto-blocked the task and it is now Blocked, waiting for a
+    human. The message must say WHY.
+
+    It used to read the payload key ``failures`` — the UNIFIED
+    ``consecutive_failures`` counter — and announce "it failed N times in a
+    row". That counter does not tick for a protocol-violation trip (the
+    violation budget is deliberately separate: "must not consume the unified
+    budget"), so a task that violated the protocol three times in a row was
+    announced as "it failed 1 times in a row" — a confident statement about a
+    number that does not describe the event, the same class of bug as
+    ``t_94a810ea``'s "max_runtime=0s". It was also grammatically broken
+    ("1 times").
+
+    ``gave_up_cause`` owns the wording so the gateway and the TUI cannot
+    drift apart again; it names a cause-specific key when one is present,
+    otherwise the trigger outcome, and invents no count when neither is.
+    """
+    cause = gave_up_cause(_payload_dict(ev))
     last = _clip(ev, "error", " (last: {})", 160)
     return (
-        f"⛔ {n.head} is now blocked: {count}{last}. Fix the cause, then `hermes kanban unblock "
+        f"⛔ {n.head} is now blocked: {cause}{last}. Fix the cause, then `hermes kanban unblock "
         f"{n.task_id}` (or `hermes kanban reassign {n.task_id}`). Logs: `hermes kanban log {n.task_id}`.",
         None, None,
     )

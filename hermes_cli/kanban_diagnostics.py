@@ -15,6 +15,8 @@ from typing import Any, Callable, Iterable, Optional
 import json
 import time
 
+from hermes_cli.kanban_notice import times_phrase
+
 
 # Least → most urgent; sorted outputs put critical first.
 SEVERITY_ORDER = ("warning", "error", "critical")
@@ -397,10 +399,13 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     severity = "critical" if failures >= threshold * 2 else "error"
     err_snippet = _error_snippet(last_err)
     outcome_label = _OUTCOME_LABELS.get(most_recent_outcome or "", "failure")
+    # "1 times" reads as machine output — the singular/plural distinction
+    # matters as much as the count itself being right.
+    count_phrase = times_phrase(failures) or "several times"
     if err_snippet:
         title = f"Agent {outcome_label} x{failures}: {err_snippet.splitlines()[0][:160]}"
         detail = (
-            f"This task has failed {failures} times in a row (most recent: {outcome_label}). Full "
+            f"This task has failed {count_phrase} in a row (most recent: {outcome_label}). Full "
             f"last error:\n\n{err_snippet}\n\nThe dispatcher circuit breaker is configured for "
             f"{failure_limit} consecutive non-success attempts. Fix the root cause and reclaim or "
             f"unblock the task to retry."
@@ -408,7 +413,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     else:
         title = f"Agent {outcome_label} x{failures} (no error recorded)"
         detail = (
-            f"This task has failed {failures} times in a row (most recent: {outcome_label}) but no "
+            f"This task has failed {count_phrase} in a row (most recent: {outcome_label}) but no "
             f"error text was captured. Check the suggested command or the worker log."
         )
     return [Diagnostic(

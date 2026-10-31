@@ -29,6 +29,30 @@ def test_gave_up_says_blocked_and_names_unblock_log_reassign():
     assert "spawn failures" not in msg  # wrong for crash/timeout-triggered trips
 
 
+def test_gave_up_names_the_trigger_outcome_not_the_unified_counter():
+    """The breaker trip names the cause that tripped it.
+
+    ``failures`` is the UNIFIED ``consecutive_failures`` counter. A
+    protocol-violation trip does not tick it, so quoting it as the cause
+    would be a false cause (the same class as "max_runtime=0s"). The
+    ``trigger_outcome`` in the payload IS the cause of this trip.
+    """
+    msg, _wake, _reason = _EVENT_FORMATTERS["gave_up"](
+        _event(failures=1, trigger_outcome="crashed", error="pid 12152 not alive"), _names())
+    assert "crash" in msg.lower()
+    assert "1 times in a row" not in msg
+    assert "times in a row" not in msg
+
+
+def test_gave_up_names_the_protocol_violation_streak():
+    """A violation trip names the violation streak, not the unified counter."""
+    msg, _wake, _reason = _EVENT_FORMATTERS["gave_up"](
+        _event(failures=1, trigger_outcome="crashed",
+               protocol_violations=3, protocol_violation_limit=3), _names())
+    assert "3 protocol violations" in msg
+    assert "1 times in a row" not in msg
+
+
 def test_crashed_and_timed_out_say_retry_and_hide_internals():
     crashed, *_ = _EVENT_FORMATTERS["crashed"](_event(), _names())
     timed_out, *_ = _EVENT_FORMATTERS["timed_out"](_event(limit_seconds=1800), _names())
