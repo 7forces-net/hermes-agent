@@ -1310,9 +1310,18 @@ def _record_task_failure(
                     conn, task_id, outcome=outcome, status=outcome, error=error,
                     metadata={"failures": failures, "retry_status": retry_status},
                 )
+                # ``event_payload_extra`` carries the CAUSE (e.g. ``budget_used``/
+                # ``budget_max`` for an iteration-budget exhaustion). Dropping it here
+                # left the notifiers with no cause to read, so they fell back to
+                # ``limit_seconds`` -> absent -> 0 and announced a bogus
+                # "max_runtime=0s". Merge it exactly like the ``gave_up`` branch
+                # below does, so the event names the real reason.
+                event_payload = {"error": error, "failures": failures, "retry_status": retry_status}
+                if event_payload_extra:
+                    event_payload.update(event_payload_extra)
                 _kb._append_event(
                     conn, task_id, outcome,
-                    {"error": error, "failures": failures, "retry_status": retry_status},
+                    event_payload,
                     run_id=run_id,
                 )
             return False

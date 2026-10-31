@@ -18,6 +18,14 @@ from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 
+# Legacy ``timed_out`` events (written before the producer carried the cause
+# keys) name the iteration budget only in their error text:
+# "Iteration budget exhausted (256/256) — task could not complete ...".
+# Parsing it lets those already-queued events render their real cause too.
+_BUDGET_EXHAUSTED_RE = re.compile(
+    r"iteration budget exhausted\s*\(\s*(\d+)\s*/\s*(\d+)\s*\)", re.IGNORECASE
+)
+
 
 def _kbc():
     from hermes_cli import kanban_db_connect
@@ -315,6 +323,21 @@ def _payload(ev: Any, key: str) -> Any:
     return ev.payload.get(key) if ev.payload and ev.payload.get(key) else None
 
 
+def _payload_int(ev: Any, key: str) -> Optional[int]:
+    """Shared payload read coerced to int; None when missing or not numeric.
+
+    A notification must never raise on a malformed payload, so every
+    conversion here is total.
+    """
+    value = _payload(ev, key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _clip(ev: Any, key: str, fmt: str, limit: int) -> str:
     """``fmt`` applied to the truncated payload value, or ``""`` when absent."""
     value = _payload(ev, key)
@@ -401,9 +424,39 @@ def _fmt_gave_up(ev, n) -> tuple:
 
 
 def _fmt_timed_out(ev, n) -> tuple:
-    limit = int(_payload(ev, "limit_seconds") or 0)
-    minutes = max(1, round(limit / 60)) if limit else 0
-    span = f"its {minutes}-minute limit" if minutes else "its time limit"
+    """Name the REAL cause of a timeout.
+
+    An iteration-budget exhaustion (``budget_max``) is NOT a wall-clock
+    timeout, so it must not be described as one. The enforced wall-clock
+    limit (``limit_seconds``) is a real, non-zero runtime. When neither key
+    is present the cause is simply unknown — saying "its time limit" would
+    name a limit that may not exist.
+    """
+    budget_max = _payload_int(ev, "budget_max")
+    if budget_max:
+        used = _payload_int(ev, "budget_used")
+        used_text = f"{used}/{budget_max}" if used is not None else f"?/{budget_max}"
+        return (
+            f"⏱ {n.head} ran out of iteration budget ({used_text}) and was stopped; "
+            "it will be retried automatically.",
+            None, None,
+        )
+    # Legacy events (written before the producer carried the cause keys) name
+    # the budget only in their error text.
+    match = _BUDGET_EXHAUSTED_RE.search(str(_payload(ev, "error") or ""))
+    if match:
+        used, budget_max = match.group(1), match.group(2)
+        return (
+            f"⏱ {n.head} ran out of iteration budget ({used}/{budget_max}) and was stopped; "
+            "it will be retried automatically.",
+            None, None,
+        )
+    limit = _payload_int(ev, "limit_seconds")
+    if limit:
+        minutes = max(1, round(limit / 60))
+        span = f"its {minutes}-minute limit"
+    else:
+        span = "an unknown limit"
     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
 
 

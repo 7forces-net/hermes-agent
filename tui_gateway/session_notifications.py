@@ -5,8 +5,17 @@ desktop UI wiring, HUD surface note. Bodies are rebound onto server.py's globals
 from __future__ import annotations
 
 import contextlib
+import re
 
 from .method_ctx import bind_module
+
+# Legacy ``timed_out`` events (written before the producer carried the cause
+# keys) name the iteration budget only in their error text:
+# "Iteration budget exhausted (256/256) — task could not complete ...".
+# Parsing it lets those already-queued events render their real cause too.
+_BUDGET_EXHAUSTED_RE = re.compile(
+    r"iteration budget exhausted\s*\(\s*(\d+)\s*/\s*(\d+)\s*\)", re.IGNORECASE
+)
 
 
 def _notif_locked_sessions(fn, default):
@@ -304,10 +313,48 @@ def _kb_completed(task, payload: dict, title: str) -> str:
     return f" done — {title}{handoff}"
 
 
+def _kb_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    """Best-effort int; ``default`` when the value is missing or not numeric.
+
+    A notification must never raise on a malformed payload (the poller runs
+    inside the TUI event loop), so every conversion here is total.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _kb_timed_out(task, payload: dict, title: str) -> str:
-    with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+    """Name the REAL cause of a timeout.
+
+    Three causes exist, in priority order:
+      * iteration budget exhausted (``budget_max``) — the worker ran out of API
+        calls, not seconds;
+      * the wall-clock limit was enforced (``limit_seconds``) — the SIGTERM/
+        SIGKILL path, which carries a real, non-zero runtime;
+      * neither — an unknown cause, which must NOT be rendered as
+        "max_runtime=0s": a 0-second runtime is not a possible state, so
+        printing it is a category error that sends the reader hunting for a
+        nonexistent timeout.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    budget_max = _kb_int(payload.get("budget_max"))
+    if budget_max:
+        used = _kb_int(payload.get("budget_used"))
+        used_text = f"{used}/{budget_max}" if used is not None else f"?/{budget_max}"
+        return f" timed out (iteration budget {used_text}); will retry"
+    # Legacy events (no cause keys) still name the budget in their error text.
+    match = _BUDGET_EXHAUSTED_RE.search(str(payload.get("error") or ""))
+    if match:
+        used, budget_max = match.group(1), match.group(2)
+        return f" timed out (iteration budget {used}/{budget_max}); will retry"
+    limit = _kb_int(payload.get("limit_seconds"))
+    if limit:
+        return f" timed out (max_runtime={limit}s); will retry"
+    return " timed out (unknown cause; will retry)"
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
