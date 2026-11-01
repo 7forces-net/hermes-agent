@@ -835,6 +835,16 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # The worker's exit status, captured by the process that OWNED the child handle
+    # and persisted so a DIFFERENT process can classify the death. The in-memory
+    # registry (``kanban_db_dispatch._recent_worker_exits``) is per-process, so on a
+    # board with more than one dispatcher (the gateway plus a ``hermes kanban
+    # dispatch`` CLI tick) the process that books the crash is usually NOT the one
+    # that spawned the worker -- and the cause was lost entirely (0 of 3387 live
+    # ``crashed`` events carried ``exit_kind``/``exit_code``). NULL = the exit
+    # status was never observed (hard kill, or the row predates this column).
+    ("worker_exit_kind", "worker_exit_kind TEXT"),
+    ("worker_exit_code", "worker_exit_code INTEGER"),
 )
 
 

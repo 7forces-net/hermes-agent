@@ -3421,6 +3421,19 @@ def main():
     _warn_if_unsupervised_pid1()
     _advertise_agent_env()
 
+    # A Kanban worker records its OWN exit status on the board before it
+    # exits. The dispatcher's exit registry is per-process, and the process
+    # that spawns a worker usually exits before the worker dies (a short-lived
+    # ``hermes kanban dispatch`` tick), so the dispatcher cannot learn the exit
+    # code -- the worker is the only process that knows it. Installed here so
+    # EVERY launch path (fast-chat, fast-cli, full dispatch) is covered.
+    try:
+        from hermes_cli.kanban_worker_exit_report import install_exit_report_hook
+
+        install_exit_report_hook()
+    except Exception:
+        pass
+
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:
         from hermes_cli.stdio import configure_windows_stdio

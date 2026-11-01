@@ -221,10 +221,17 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
-    # Bit-level POSIX wait-status decode instead of os.WIFEXITED/WEXITSTATUS/
-    # WIFSIGNALED/WTERMSIG: those helpers do not exist on Windows, where the
-    # registry is fed by reap_worker_zombies' Popen poll. Low 7 bits = signal
-    # (0 = normal exit, 0x7F = stopped), bits 8-15 = exit code.
+    return _decode_wait_status(raw)
+
+
+def _decode_wait_status(raw: int) -> "tuple[str, Optional[int]]":
+    """``(kind, code)`` for a raw wait status.
+
+    Bit-level POSIX wait-status decode instead of os.WIFEXITED/WEXITSTATUS/
+    WIFSIGNALED/WTERMSIG: those helpers do not exist on Windows, where the
+    registry is fed by reap_worker_zombies' Popen poll. Low 7 bits = signal
+    (0 = normal exit, 0x7F = stopped), bits 8-15 = exit code.
+    """
     raw = int(raw)
     signal_number = raw & 0x7F
     if signal_number == 0:
@@ -239,18 +246,99 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
-def reap_worker_zombies() -> "list[int]":
+def _persist_worker_exit(conn: sqlite3.Connection, pid: int, raw_status: int) -> None:
+    """Persist a reaped child's exit status on its run row, so ANY process can
+    classify the death later.
+
+    The in-memory registry (``_recent_worker_exits``) only exists in the
+    process that reaped the child. On a board with more than one dispatcher the
+    process that books the crash is usually NOT the one that spawned the
+    worker, so the registry lookup missed and the cause was dropped from the
+    event payload entirely (0 of 3387 live ``crashed`` events carried
+    ``exit_kind``/``exit_code``). The run row outlives both processes, so
+    writing the status there makes the classification process-independent.
+
+    Best-effort: a failure here must never break the reap.
+    """
+    try:
+        kind, code = _decode_wait_status(raw_status)
+        if kind == "unknown" and code is None:
+            return
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET worker_exit_kind = ?, worker_exit_code = ? "
+                "WHERE worker_pid = ? AND worker_exit_kind IS NULL",
+                (kind, code, int(pid)),
+            )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: could not persist worker exit status for pid %s",
+            pid, exc_info=True,
+        )
+
+
+def _read_persisted_worker_exit(
+    conn: sqlite3.Connection, pid: int, task_id: Optional[str] = None,
+) -> "tuple[str, Optional[int]]":
+    """``(kind, code)`` for a worker whose exit status was persisted by the
+    process that owned its handle. ``("unknown", None)`` when no run row
+    carries it.
+
+    Looked up by TASK first (the run row the worker owned), then by pid: the
+    task is the stable identity, while a pid may have been recycled by the
+    time the sweeper runs.
+    """
+    try:
+        if task_id:
+            row = conn.execute(
+                "SELECT worker_exit_kind, worker_exit_code FROM task_runs "
+                "WHERE task_id = ? AND worker_exit_kind IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is not None:
+                kind = str(row["worker_exit_kind"] or "")
+                code = row["worker_exit_code"]
+                if kind:
+                    return (kind, int(code) if code is not None else None)
+        row = conn.execute(
+            "SELECT worker_exit_kind, worker_exit_code FROM task_runs "
+            "WHERE worker_pid = ? AND worker_exit_kind IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (int(pid),),
+        ).fetchone()
+    except Exception:
+        return ("unknown", None)
+    if row is None:
+        return ("unknown", None)
+    kind = str(row["worker_exit_kind"] or "")
+    code = row["worker_exit_code"]
+    if not kind:
+        return ("unknown", None)
+    return (kind, int(code) if code is not None else None)
+
+
+def reap_worker_zombies(conn: Optional[sqlite3.Connection] = None) -> "list[int]":
     """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
     every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
     parked by ``_default_spawn`` (the only way to learn a child's exit code
-    there), so the rate-limit sentinel exit is classified on both hosts."""
+    there), so the rate-limit sentinel exit is classified on both hosts.
+
+    With ``conn``, the reaped exit status is ALSO persisted on the run row
+    (:func:`_persist_worker_exit`) so a different process can classify the
+    death later. The in-memory registry alone is not enough: the process that
+    books the crash is usually not the one that spawned the worker.
+    """
     reaped: "list[int]" = []
     if _kb._IS_WINDOWS:
         for pid, proc in list(_live_worker_procs.items()):
             returncode = proc.poll()
             if returncode is None:
                 continue
-            _record_worker_exit(pid, _wait_status_from_returncode(returncode))
+            raw_status = _wait_status_from_returncode(returncode)
+            _record_worker_exit(pid, raw_status)
+            if conn is not None:
+                _persist_worker_exit(conn, pid, raw_status)
             _live_worker_procs.pop(pid, None)
             reaped.append(pid)
         return reaped
@@ -263,6 +351,8 @@ def reap_worker_zombies() -> "list[int]":
             if pid == 0:
                 break
             _record_worker_exit(pid, status)
+            if conn is not None:
+                _persist_worker_exit(conn, pid, status)
             reaped.append(pid)
     except Exception:
         pass
@@ -991,6 +1081,7 @@ class _DeadWorker:
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -998,7 +1089,7 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer)
+    dead = _classify_dead_worker_exit(pid, claimer, conn=conn, task_id=task_id)
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1007,9 +1098,20 @@ def _classify_dead_worker(
     return dead
 
 
-def _classify_dead_worker_exit(pid: int, claimer: Optional[str]) -> _DeadWorker:
+def _classify_dead_worker_exit(
+    pid: int, claimer: Optional[str], conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
+) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in."""
     kind, code = _classify_worker_exit(pid)
+    if kind == "unknown" and conn is not None:
+        # The in-memory registry is per-process. The process that reaped the
+        # worker is usually NOT the one that books the crash (a board can have
+        # the gateway plus a ``hermes kanban dispatch`` CLI tick, and the CLI
+        # process exits right after it spawns). Fall back to the status the
+        # owner persisted on the run row, so the cause survives the process
+        # boundary instead of being dropped from the payload entirely.
+        kind, code = _read_persisted_worker_exit(conn, pid, task_id=task_id)
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
@@ -1089,7 +1191,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            dead = _classify_dead_worker(
+                pid, row["claim_lock"], task_id=row["id"], board=board, conn=conn,
+            )
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1964,7 +2068,7 @@ def _run_reclaim_phase(
     board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
-    reap_worker_zombies()
+    reap_worker_zombies(conn)
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
