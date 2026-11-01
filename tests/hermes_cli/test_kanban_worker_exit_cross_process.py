@@ -287,6 +287,8 @@ def test_in_memory_registry_still_wins_when_present(board, monkeypatch):
     (the same pid could have been reused), so the in-process answer wins.
     """
     conn, task_id, run_id = board
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
     proc = _spawn_exit(3)
     _attach_worker(conn, task_id, run_id, proc.pid)
     kbd._live_worker_procs[proc.pid] = proc
