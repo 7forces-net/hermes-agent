@@ -30,6 +30,13 @@
 import { host, type PluginOs, type PluginRestOptions, type PluginTranslate } from '@hermes/plugin-sdk'
 
 import { en } from './i18n'
+import {
+  clipText,
+  crashedCauseLabel,
+  protocolViolationCauseLabel,
+  reclaimedCauseLabel,
+  timedOutCauseLabel
+} from './notice-cause'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 
@@ -44,13 +51,24 @@ type ToastKind = 'error' | 'success' | 'warning'
 
 /** Terminal kinds → toast severity + i18n title key. Mirrors the gateway
  *  watcher's ping set (gateway/kanban_watchers.py) minus the intentionally
- *  silent kinds (status/archived/unblocked, which only advance the cursor). */
+ *  silent kinds (status/archived/unblocked, which only advance the cursor).
+ *
+ *  ``protocol_violation`` (the worker finished but never reported a result)
+ *  and ``reclaimed`` (the dispatcher's watchdog took a stale task back) are
+ *  BOTH here now: they were missing, so a task that hung and was reclaimed,
+ *  or a worker that exited cleanly without a verdict, produced NO desktop
+ *  toast at all — the same silent-stall shape the gateway/TUI renderers had.
+ *  Adding a kind is safe against a notification storm: the first observation
+ *  of a board baselines the cursor at MAX(task_events.id), so history is never
+ *  replayed. */
 const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>([
   ['blocked', { titleKey: 'notify.blockedTitle', toast: 'warning' }],
   ['block_loop_detected', { titleKey: 'notify.blockLoopTitle', toast: 'warning' }],
   ['completed', { titleKey: 'notify.completedTitle', toast: 'success' }],
   ['crashed', { titleKey: 'notify.crashedTitle', toast: 'error' }],
   ['gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'error' }],
+  ['protocol_violation', { titleKey: 'notify.protocolViolationTitle', toast: 'error' }],
+  ['reclaimed', { titleKey: 'notify.reclaimedTitle', toast: 'warning' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
 
@@ -118,7 +136,14 @@ function trimmed(value: unknown): string {
 /** The human handoff carried in the event payload, per kind (mirrors the
  *  payload contract the gateway watcher reads). `gave_up` deliberately has no
  *  payload body: its `error` is raw worker text, which belongs in the toast
- *  `detail` (see rawErrorFor), and the body is the plain-words i18n hint. */
+ *  `detail` (see rawErrorFor), and the body is the plain-words i18n hint.
+ *
+ *  The FAILURE kinds carry a CAUSE instead: the toast names what actually
+ *  ended the task, read from the same structured payload keys the gateway
+ *  reads (`exit_kind`/`exit_code`, the reclaim `reason`, the protocol-violation
+ *  marker). A cause is named ONLY when the payload carries one — with no cause
+ *  key the toast says the cause is UNKNOWN rather than inventing an exit code
+ *  (the `t_94a810ea` lesson). */
 function bodyFor(kind: string, ev: CompletionEvent): string {
   const payload = ev.payload
 
@@ -134,12 +159,42 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     return t('notify.gaveUpBody')
   }
 
+  if (kind === 'crashed') {
+    return crashedCauseLabel(payload, t) ?? t('notify.causeUnknown')
+  }
+
+  if (kind === 'protocol_violation') {
+    return protocolViolationCauseLabel(payload, t)
+  }
+
+  if (kind === 'reclaimed') {
+    return reclaimedCauseLabel(payload, t)
+  }
+
+  if (kind === 'timed_out') {
+    return timedOutCauseLabel(payload, t) ?? t('notify.causeUnknown')
+  }
+
   return ''
 }
 
-/** Raw machine text that must never be the toast body — surfaced muted in `detail`. */
+/** Raw machine text that must never be the toast body — surfaced muted in `detail`.
+ *
+ *  `worker_output` is the worker's own last words: RAW worker output with ANSI
+ *  escape codes, thousands of characters long. It never appears verbatim — not
+ *  in the body, not in the detail: only a short ANSI-stripped, clipped excerpt
+ *  does (the precedent `clip_worker_output` sets on the Python side). `pid` and
+ *  `claimer` stay hidden — a pid is noise to a human reader. */
 function rawErrorFor(kind: string, ev: CompletionEvent): string {
-  return kind === 'gave_up' ? trimmed(ev.payload?.error) : ''
+  if (kind === 'gave_up') {
+    return trimmed(ev.payload?.error)
+  }
+
+  if (kind === 'crashed') {
+    return clipText(ev.payload?.worker_output, 120)
+  }
+
+  return ''
 }
 
 function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {

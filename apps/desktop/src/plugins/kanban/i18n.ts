@@ -208,6 +208,42 @@ type KanbanMessages = {
     gaveUpBody: string
     crashedTitle: string
     timedOutTitle: string
+    /** Title for the clean-exit protocol violation (no result reported). */
+    protocolViolationTitle: string
+    /** Title for the stale-claim reclaim (the dispatcher took the task back). */
+    reclaimedTitle: string
+    /* Cause labels — SHORT labels for the cause the payload carries, not the
+     * gateway's sentences (this plugin cannot import the shared Python
+     * wording, and copying it is the drift that module exists to prevent).
+     * A cause is named only when the payload carries one. */
+    /** Crash with a non-zero exit code. */
+    causeExitCode: (code: number) => string
+    /** Crash whose exit code is missing — the cause is only half known. */
+    causeExitedAbnormally: string
+    /** Crash by signal, with the signal number. */
+    causeSignal: (signal: number) => string
+    /** Crash by signal whose number is missing. */
+    causeKilledBySignal: string
+    /** The worker exited cleanly WITHOUT reporting a result. */
+    causeExitedWithoutResult: string
+    /** The quota wall — not a failure. */
+    causeQuotaWall: string
+    /** No cause key on the payload: say so, invent nothing. */
+    causeUnknown: string
+    /** Reclaim with the payload's own reason text (already clipped). */
+    causeReclaimed: (reason: string) => string
+    /** Reclaim whose heartbeat went stale. */
+    causeReclaimedStale: string
+    /** Reclaim by hand. */
+    causeReclaimedManual: string
+    /** Reclaim with no reason text on the payload. */
+    causeReclaimedPlain: string
+    /** Protocol violation with a violation streak. */
+    causeProtocolViolations: (count: number) => string
+    /** Timeout caused by an iteration-budget exhaustion (used/max). */
+    causeIterationBudget: (used: string) => string
+    /** Timeout caused by the enforced wall-clock limit (minutes). */
+    causeTimeLimit: (minutes: number) => string
     openKanban: string
     artifacts: (n: number) => string
   }
@@ -421,6 +457,22 @@ export const en: KanbanMessages = {
     gaveUpBody: 'Hermes couldn’t finish this task. Open Kanban to see why and reassign it.',
     crashedTitle: 'Task hit a problem — Hermes will retry it automatically',
     timedOutTitle: 'Task took too long — Hermes will retry it automatically',
+    protocolViolationTitle: 'Task ended without a result — Hermes will retry it automatically',
+    reclaimedTitle: 'Task was reclaimed — Hermes will retry it automatically',
+    causeExitCode: (code: number) => `Exit code ${code}`,
+    causeExitedAbnormally: 'Exited abnormally',
+    causeSignal: (signal: number) => `Killed by signal ${signal}`,
+    causeKilledBySignal: 'Killed by a signal',
+    causeExitedWithoutResult: 'Exited without reporting a result',
+    causeQuotaWall: 'Hit a quota wall (rate limited)',
+    causeUnknown: 'Cause unknown',
+    causeReclaimed: (reason: string) => `Reclaimed: ${reason}`,
+    causeReclaimedStale: 'Reclaimed: the worker’s heartbeat went stale',
+    causeReclaimedManual: 'Reclaimed by hand',
+    causeReclaimedPlain: 'Reclaimed: the claim expired',
+    causeProtocolViolations: (count: number) => `Exited without reporting a result (${count} protocol violations)`,
+    causeIterationBudget: (used: string) => `Ran out of iteration budget (${used})`,
+    causeTimeLimit: (minutes: number) => `Ran past its ${minutes}-minute limit`,
     openKanban: 'Open Kanban',
     artifacts: (n: number) => `${n} artifacts`
   }
@@ -633,6 +685,22 @@ const ja: KanbanMessages = {
     gaveUpBody: 'Hermes はこのタスクを完了できませんでした。かんばんを開いて原因を確認し、再割り当てしてください。',
     crashedTitle: 'タスクで問題が発生 — Hermes が自動で再試行します',
     timedOutTitle: 'タスクに時間がかかりすぎました — Hermes が自動で再試行します',
+    protocolViolationTitle: 'タスクが結果を返さずに終了しました — Hermes が自動で再試行します',
+    reclaimedTitle: 'タスクが再取得されました — Hermes が自動で再試行します',
+    causeExitCode: (code: number) => `終了コード ${code}`,
+    causeExitedAbnormally: '異常終了',
+    causeSignal: (signal: number) => `シグナル ${signal} で停止`,
+    causeKilledBySignal: 'シグナルで停止',
+    causeExitedWithoutResult: '結果を返さずに終了',
+    causeQuotaWall: 'クォータ上限に到達（レート制限）',
+    causeUnknown: '原因は不明です',
+    causeReclaimed: (reason: string) => `再取得: ${reason}`,
+    causeReclaimedStale: '再取得: ワーカーのハートビートが古くなりました',
+    causeReclaimedManual: '手動で再取得',
+    causeReclaimedPlain: '再取得: claims の有効期限が切れました',
+    causeProtocolViolations: (count: number) => `結果を返さずに終了（プロトコル違反 ${count} 回）`,
+    causeIterationBudget: (used: string) => `反復予算を使い切りました（${used}）`,
+    causeTimeLimit: (minutes: number) => `${minutes} 分の上限を超えました`,
     openKanban: 'かんばんを開く',
     artifacts: (n: number) => `成果物 ${n} 件`
   }
@@ -842,6 +910,22 @@ const zh: KanbanMessages = {
     gaveUpBody: 'Hermes 无法完成这个任务。打开看板查看原因并重新分配。',
     crashedTitle: '任务遇到问题 — Hermes 将自动重试',
     timedOutTitle: '任务耗时过长 — Hermes 将自动重试',
+    protocolViolationTitle: '任务结束但未返回结果 — Hermes 将自动重试',
+    reclaimedTitle: '任务已被回收 — Hermes 将自动重试',
+    causeExitCode: (code: number) => `退出码 ${code}`,
+    causeExitedAbnormally: '异常退出',
+    causeSignal: (signal: number) => `被信号 ${signal} 终止`,
+    causeKilledBySignal: '被信号终止',
+    causeExitedWithoutResult: '退出但未返回结果',
+    causeQuotaWall: '触发配额上限（速率限制）',
+    causeUnknown: '原因未知',
+    causeReclaimed: (reason: string) => `已回收：${reason}`,
+    causeReclaimedStale: '已回收：工作进程的心跳已过期',
+    causeReclaimedManual: '手动回收',
+    causeReclaimedPlain: '已回收：认领已过期',
+    causeProtocolViolations: (count: number) => `退出但未返回结果（${count} 次协议违规）`,
+    causeIterationBudget: (used: string) => `迭代预算已耗尽（${used}）`,
+    causeTimeLimit: (minutes: number) => `超过了 ${minutes} 分钟的上限`,
     openKanban: '打开看板',
     artifacts: (n: number) => `${n} 个产物`
   }
@@ -1051,6 +1135,22 @@ const zhHant: KanbanMessages = {
     gaveUpBody: 'Hermes 無法完成這個任務。開啟看板查看原因並重新指派。',
     crashedTitle: '任務遇到問題 — Hermes 將自動重試',
     timedOutTitle: '任務耗時過長 — Hermes 將自動重試',
+    protocolViolationTitle: '任務結束但未回傳結果 — Hermes 將自動重試',
+    reclaimedTitle: '任務已被回收 — Hermes 將自動重試',
+    causeExitCode: (code: number) => `結束代碼 ${code}`,
+    causeExitedAbnormally: '異常結束',
+    causeSignal: (signal: number) => `被訊號 ${signal} 終止`,
+    causeKilledBySignal: '被訊號終止',
+    causeExitedWithoutResult: '結束但未回傳結果',
+    causeQuotaWall: '觸及配額上限（速率限制）',
+    causeUnknown: '原因未知',
+    causeReclaimed: (reason: string) => `已回收：${reason}`,
+    causeReclaimedStale: '已回收：工作程序的心跳已過期',
+    causeReclaimedManual: '手動回收',
+    causeReclaimedPlain: '已回收：認領已過期',
+    causeProtocolViolations: (count: number) => `結束但未回傳結果（${count} 次協定違規）`,
+    causeIterationBudget: (used: string) => `迭代預算已耗盡（${used}）`,
+    causeTimeLimit: (minutes: number) => `超過了 ${minutes} 分鐘的上限`,
     openKanban: '開啟看板',
     artifacts: (n: number) => `${n} 個產物`
   }

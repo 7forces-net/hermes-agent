@@ -442,7 +442,7 @@ describe('terminal kinds beyond completed', () => {
     })
   })
 
-  it('gave_up: plain-words body, raw payload error only in detail; crashed and timed_out fall back to the task id', async () => {
+  it('gave_up: plain-words body, raw payload error only in detail; crashed names a cause; timed_out falls back to the task id', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
 
@@ -456,10 +456,17 @@ describe('terminal kinds beyond completed', () => {
     expect(gaveUp.detail).toContain('t101')
     expect(gaveUp.action?.label).toBe('Open Kanban')
 
+    // A crash with NO cause key on the payload now says the cause is unknown
+    // instead of falling back to the bare task id — the desktop named NO cause
+    // for any kind before, which is the gap this card closes. The timeout
+    // likewise names its cause (or says unknown).
     await m.onKanbanEventsFrame('smoke', [ev(102, 'crashed'), ev(103, 'timed_out', { limit_seconds: 900 })])
     expect(hostMock.notify).toHaveBeenCalledTimes(3)
-    expect(hostMock.notify.mock.calls[1][0]).toMatchObject({ kind: 'error', message: 't102' })
-    expect(hostMock.notify.mock.calls[2][0]).toMatchObject({ kind: 'warning', message: 't103' })
+    expect(hostMock.notify.mock.calls[1][0]).toMatchObject({ kind: 'error', message: 'Cause unknown' })
+    expect(hostMock.notify.mock.calls[2][0]).toMatchObject({
+      kind: 'warning',
+      message: 'Ran past its 15-minute limit'
+    })
   })
 
   it('gave_up without a payload error still gets the plain-words body and no empty detail noise', async () => {
@@ -587,5 +594,264 @@ describe('i18n routing', () => {
     await m.onKanbanEventsFrame('smoke', [ev(101, 'timed_out')])
 
     expect(lastNotify().title).toBe('Task took too long — Hermes will retry it automatically')
+  })
+})
+
+/**
+ * The cause-naming contract for the desktop renderer.
+ *
+ * The gateway and the TUI name the real cause of a crash / reclaim / protocol
+ * violation through the shared Python helper `hermes_cli/kanban_notice.py`.
+ * This plugin is TypeScript in a separate build and CANNOT import it — so it
+ * does not copy the gateway's sentences (that is the drift the shared module
+ * exists to prevent). It derives the cause from the SAME STRUCTURED PAYLOAD
+ * KEYS and renders short local labels.
+ *
+ * The rule under test, unchanged from the Python side:
+ * name a cause only when the payload carries one; never invent one.
+ */
+describe('cause naming (desktop renderer)', () => {
+  it('crashed with a non-zero exit code names the code', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'crashed', { exit_kind: 'nonzero_exit', exit_code: 1 })
+    ])
+
+    expect(lastNotify()).toMatchObject({
+      kind: 'error',
+      title: 'Task hit a problem — Hermes will retry it automatically',
+      message: 'Exit code 1'
+    })
+  })
+
+  it('crashed by signal names the signal', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'crashed', { exit_kind: 'signaled', exit_code: 9 })
+    ])
+
+    expect(lastNotify().message).toBe('Killed by signal 9')
+  })
+
+  it('crashed with NO cause key says the cause is unknown and invents no exit code', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'crashed', { pid: 4242 })])
+
+    const toast = lastNotify()
+    expect(toast.message).toBe('Cause unknown')
+    // The t_94a810ea lesson: never a plausible-looking exit code.
+    expect(toast.message).not.toMatch(/code\s*\d/i)
+    expect(toast.message).not.toMatch(/signal\s*\d/i)
+    expect(toast.message).not.toContain('unknown exit')
+  })
+
+  it('a cause that needs a code but has none says the HALF-cause, never a machine token', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'crashed', { exit_kind: 'nonzero_exit' }),
+      ev(102, 'crashed', { exit_kind: 'signaled' })
+    ])
+
+    expect(hostMock.notify.mock.calls[0][0]).toMatchObject({ message: 'Exited abnormally' })
+    expect(hostMock.notify.mock.calls[1][0]).toMatchObject({ message: 'Killed by a signal' })
+    // The machine token must never reach a human message.
+    expect(hostMock.notify.mock.calls[0][0].message).not.toContain('nonzero_exit')
+    expect(hostMock.notify.mock.calls[1][0].message).not.toContain('signaled')
+  })
+
+  it('a quota wall is not called a crash', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'crashed', { exit_kind: 'rate_limited', exit_code: 75 })
+    ])
+
+    expect(lastNotify().message).toBe('Hit a quota wall (rate limited)')
+  })
+
+  it('an UNRECOGNISED exit_kind is treated as no cause, not echoed', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'crashed', { exit_kind: 'something_new', exit_code: 3 })
+    ])
+
+    expect(lastNotify().message).toBe('Cause unknown')
+    expect(lastNotify().message).not.toContain('something_new')
+  })
+
+  it('worker_output never appears verbatim: a short ANSI-stripped excerpt only', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const raw = `Provider said: HTTP 429: The usage limit has been reached \u001b[38;2;255;0;0m${'x'.repeat(500)}`
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'crashed', { exit_kind: 'nonzero_exit', exit_code: 1, worker_output: raw })
+    ])
+
+    const toast = lastNotify()
+    // The raw string never appears — not in the body, not in the detail.
+    expect(toast.message).not.toContain(raw)
+    expect(toast.detail ?? '').not.toContain(raw)
+    expect(`${toast.message} ${toast.detail ?? ''}`).not.toContain('\u001b[')
+    // The excerpt survives, clipped.
+    expect(toast.detail).toContain('Provider said: HTTP 429')
+    expect((toast.detail ?? '').length).toBeLessThan(400)
+  })
+
+  it('pid and claimer stay hidden', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'crashed', {
+        exit_kind: 'nonzero_exit',
+        exit_code: 1,
+        pid: 4242,
+        claimer: 'DESKTOP-7G7SGH3:14236'
+      })
+    ])
+
+    const toast = lastNotify()
+    expect(`${toast.title} ${toast.message} ${toast.detail ?? ''}`).not.toContain('4242')
+    expect(`${toast.title} ${toast.message} ${toast.detail ?? ''}`).not.toContain('DESKTOP-7G7SGH3')
+  })
+
+  it('timed_out names the iteration budget, not a wall-clock timeout', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'timed_out', { budget_used: 256, budget_max: 256 })
+    ])
+
+    expect(lastNotify().message).toBe('Ran out of iteration budget (256/256)')
+    expect(lastNotify().message).not.toMatch(/minute/)
+  })
+
+  it('timed_out reads the budget out of a legacy error text', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'timed_out', {
+        error: 'Iteration budget exhausted (256/256) — task could not complete within the allowed iterations'
+      })
+    ])
+
+    expect(lastNotify().message).toBe('Ran out of iteration budget (256/256)')
+  })
+
+  it('timed_out names the wall-clock limit when there is no budget cause', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'timed_out', { limit_seconds: 900 })])
+
+    expect(lastNotify().message).toBe('Ran past its 15-minute limit')
+  })
+
+  it('timed_out with no cause key says unknown and names no limit', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'timed_out', null)])
+
+    expect(lastNotify().message).toBe('Cause unknown')
+    expect(lastNotify().message).not.toMatch(/minute|limit|budget/i)
+  })
+})
+
+describe('protocol_violation and reclaimed reach the desktop', () => {
+  it('protocol_violation notifies and says the worker exited without reporting a result', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'protocol_violation', { exit_kind: 'clean_exit', exit_code: 0, protocol_violation: true })
+    ])
+
+    expect(fired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+    expect(lastNotify()).toMatchObject({
+      kind: 'error',
+      title: 'Task ended without a result — Hermes will retry it automatically',
+      message: 'Exited without reporting a result'
+    })
+  })
+
+  it('protocol_violation names the violation streak when the payload carries one', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'protocol_violation', { exit_kind: 'clean_exit', protocol_violations: 3 })
+    ])
+
+    expect(lastNotify().message).toBe('Exited without reporting a result (3 protocol violations)')
+  })
+
+  it('reclaimed notifies and shows the payload reason', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const fired = await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'reclaimed', {
+        reason: 'watchdog: hard reclaim of stuck task (running 2.1h with no completion)',
+        manual: true,
+        prev_pid: 4856,
+        prev_lock: 'DESKTOP-7G7SGH3:10832'
+      })
+    ])
+
+    expect(fired).toBe(true)
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+    expect(lastNotify()).toMatchObject({
+      kind: 'warning',
+      title: 'Task was reclaimed — Hermes will retry it automatically',
+      message: 'Reclaimed: watchdog: hard reclaim of stuck task (running 2.1h with no completion)'
+    })
+    // pid / lock stay hidden.
+    expect(lastNotify().detail ?? '').not.toContain('4856')
+    expect(lastNotify().detail ?? '').not.toContain('DESKTOP-7G7SGH3')
+  })
+
+  it('reclaimed without a reason falls back to a truthful local phrase', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'reclaimed', { prev_pid: 7 })])
+    expect(lastNotify().message).toBe('Reclaimed: the claim expired')
+
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'reclaimed', { heartbeat_stale: true })])
+    expect(lastNotify().message).toBe('Reclaimed: the worker’s heartbeat went stale')
+
+    await m.onKanbanEventsFrame('smoke', [ev(103, 'reclaimed', { manual: true })])
+    expect(lastNotify().message).toBe('Reclaimed by hand')
+  })
+
+  it('a long reclaim reason is clipped to one line and one length cap', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    const reason = `watchdog: ${'detail '.repeat(80)}`
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'reclaimed', { reason })])
+
+    const message = lastNotify().message
+    expect(message.length).toBeLessThan(200)
+    expect(message.endsWith('…')).toBe(true)
+    expect(message).not.toContain('\n')
   })
 })
