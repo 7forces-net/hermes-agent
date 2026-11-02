@@ -228,6 +228,10 @@ type KanbanMessages = {
     causeExitedWithoutResult: string
     /** The quota wall — not a failure. */
     causeQuotaWall: string
+    /** Title for the quota wall (the provider is out of credits). */
+    rateLimitedTitle: string
+    /** Body for the quota wall: requeued, will be retried, NOT a failure. */
+    rateLimitedBody: string
     /** No cause key on the payload: say so, invent nothing. */
     causeUnknown: string
     /** Reclaim with the payload's own reason text (already clipped). */
@@ -465,6 +469,8 @@ export const en: KanbanMessages = {
     causeKilledBySignal: 'Killed by a signal',
     causeExitedWithoutResult: 'Exited without reporting a result',
     causeQuotaWall: 'Hit a quota wall (rate limited)',
+    rateLimitedTitle: 'Provider quota wall — Hermes will retry it automatically',
+    rateLimitedBody: 'The provider hit a quota wall (rate limited). The task was requeued and will be retried, and it does not count as a failure. Add credits or switch provider.',
     causeUnknown: 'Cause unknown',
     causeReclaimed: (reason: string) => `Reclaimed: ${reason}`,
     causeReclaimedStale: 'Reclaimed: the worker’s heartbeat went stale',
@@ -693,6 +699,8 @@ const ja: KanbanMessages = {
     causeKilledBySignal: 'シグナルで停止',
     causeExitedWithoutResult: '結果を返さずに終了',
     causeQuotaWall: 'クォータ上限に到達（レート制限）',
+    rateLimitedTitle: 'プロバイダーのクォータ上限に到達 — Hermes が自動的に再試行します',
+    rateLimitedBody: 'プロバイダーがクォータ上限（レート制限）に到達しました。タスクは再キューされ、自動的に再試行されます。失敗としてはカウントされません。クレジットを追加するかプロバイダーを切り替えてください。',
     causeUnknown: '原因は不明です',
     causeReclaimed: (reason: string) => `再取得: ${reason}`,
     causeReclaimedStale: '再取得: ワーカーのハートビートが古くなりました',
@@ -918,6 +926,8 @@ const zh: KanbanMessages = {
     causeKilledBySignal: '被信号终止',
     causeExitedWithoutResult: '退出但未返回结果',
     causeQuotaWall: '触发配额上限（速率限制）',
+    rateLimitedTitle: '提供商配额上限 — Hermes 将自动重试',
+    rateLimitedBody: '提供商触发配额上限（速率限制）。任务已重新排队并将重试，且不计为失败。请充值或切换提供商。',
     causeUnknown: '原因未知',
     causeReclaimed: (reason: string) => `已回收：${reason}`,
     causeReclaimedStale: '已回收：工作进程的心跳已过期',
@@ -1143,6 +1153,8 @@ const zhHant: KanbanMessages = {
     causeKilledBySignal: '被訊號終止',
     causeExitedWithoutResult: '結束但未回傳結果',
     causeQuotaWall: '觸及配額上限（速率限制）',
+    rateLimitedTitle: '供應商配額上限 — Hermes 將自動重試',
+    rateLimitedBody: '供應商觸發配額上限（速率限制）。工作已重新排隊並將重試，且不計為失敗。請儲值或切換供應商。',
     causeUnknown: '原因未知',
     causeReclaimed: (reason: string) => `已回收：${reason}`,
     causeReclaimedStale: '已回收：工作程序的心跳已過期',

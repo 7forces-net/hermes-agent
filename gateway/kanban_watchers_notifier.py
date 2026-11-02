@@ -21,6 +21,8 @@ from hermes_cli.kanban_notice import (
     clip_worker_output,
     crashed_cause,
     gave_up_cause,
+    rate_limited_cause,
+    rate_limited_detail,
     reclaimed_cause,
 )
 
@@ -57,14 +59,38 @@ def _kbn():
 # ``t_f4c4ba10`` fixed for ``protocol_violation``, one event kind over. It
 # SHOULD wake the origin: a reclaimed task is requeued, but a human may want
 # to know the task was hanging.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "protocol_violation", "reclaimed")
+# ``rate_limited`` is the provider quota wall. It was in NEITHER list either,
+# so the 1682 quota-wall events of the 17.8 h dead-quota window produced ZERO
+# notifications and ZERO wakes: the board did the right thing silently
+# (requeued, no failure counted, cooldown honoured) and the operator was told
+# nothing at all.
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "protocol_violation", "reclaimed", "rate_limited")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 # ``protocol_violation`` wakes the origin: the task is stuck with no verdict
 # and only a human (or the origin) can decide what to do about it.
 # ``reclaimed`` wakes the origin for the same reason: the worker hung and
 # the dispatcher took the task back.
-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "protocol_violation", "reclaimed")
+#
+# ``rate_limited`` DOES wake the origin, and this is a deliberate decision
+# (acceptance criterion 7), not a copy of the existing behaviour:
+#
+#   * a quota wall needs a HUMAN. No agent can add credits or switch the
+#     provider, so the condition is operator-actionable by nature — the
+#     worker's own last words say "Add credits with <provider>. Or switch
+#     providers with /model <model> --provider <provider>.";
+#   * the wake is safe because it fires ONCE PER EPISODE, not once per
+#     event: the shared claim path (``kanban_db_notify._filter_rate_limited_episodes``)
+#     suppresses the continuation events of a still-standing wall. Measured
+#     on the live board: 1682 events -> 14 episode starts (a 120:1
+#     reduction). Without that filter this entry would be an incident;
+#   * for scale: the same window already produced 255 ``reclaimed`` wake
+#     turns on the same 10 cards, so 14 more is noise-level.
+#
+# An alternative (wake never) was rejected because it leaves a condition that
+# only a human can fix completely invisible — which is precisely the failure
+# this card exists to close.
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "protocol_violation", "reclaimed", "rate_limited")
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -572,6 +598,39 @@ def _fmt_crashed(ev, n) -> tuple:
     )
 
 
+def _fmt_rate_limited(ev, n) -> tuple:
+    """Name the REAL cause of a provider quota wall.
+
+    A quota wall is NOT a crash and NOT a worker failure. The dispatcher
+    requeues a rate-limited worker WITHOUT counting a failure, so the breaker
+    does not trip and the card is retried. Announcing it as a crash would
+    misdescribe the board's behaviour and waste the operator's attention on a
+    condition that has exactly ONE remedy: add credits or switch provider.
+
+    This event had NO renderer at all before, and the kind was in no
+    subscriber's kind list either — so the 1682 quota-wall events of the
+    17.8 h dead-quota window produced ZERO notifications. The operator was
+    told nothing at all, which is exactly why the only visible symptom was an
+    unrelated pile of crash-shaped lines from the two genuine crashes.
+
+    ``rate_limited_cause``/``rate_limited_detail`` own the wording so the
+    gateway and the TUI cannot drift apart (the copy is byte-identical for the
+    same payload). The detail states what actually happened: requeued, will be
+    retried, and NOT counted as a failure — plus the actionable provider hint
+    when the payload carries one.
+
+    ``pid``/``claimer`` stay hidden: a pid is noise to a human reader.
+    """
+    payload = _payload_dict(ev)
+    cause = rate_limited_cause(payload)
+    detail = rate_limited_detail(payload)
+    return (
+        f"⏳ {n.head} — {cause}: {detail}. "
+        f"Logs: `hermes kanban log {n.task_id}`.",
+        None, None,
+    )
+
+
 def _fmt_reclaimed(ev, n) -> tuple:
     """Name the REAL cause of a stale-claim reclaim.
 
@@ -602,6 +661,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": _fmt_gave_up,
     "crashed": _fmt_crashed,
+    "rate_limited": _fmt_rate_limited,
     "reclaimed": _fmt_reclaimed,
     "protocol_violation": _fmt_protocol_violation,
     "timed_out": _fmt_timed_out,

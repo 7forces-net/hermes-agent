@@ -52,6 +52,10 @@ __all__ = [
     "crashed_cause",
     "reclaimed_cause",
     "clip_worker_output",
+    "rate_limited_cause",
+    "rate_limited_detail",
+    "rate_limited_hint",
+    "RATE_LIMITED_CAUSE",
 ]
 
 
@@ -364,3 +368,183 @@ def clip_worker_output(payload: Any, limit: int = _WORKER_OUTPUT_LIMIT) -> str:
     if len(flat) > limit:
         return flat[: limit - 1].rstrip() + "…"
     return flat
+
+
+# ---------------------------------------------------------------------------
+# The quota wall (``rate_limited``)
+# ---------------------------------------------------------------------------
+#
+# ``rate_limited`` is a FIRST-CLASS event kind the board emits:
+#
+#   hermes_cli/kanban_db_dispatch.py::_classify_dead_worker_exit
+#       if kind == "rate_limited":
+#           # Quota wall — NOT a task failure. Release to the source phase and do
+#           # NOT count a failure so a long quota window can't trip the breaker.
+#           return _DeadWorker(kind, code, ..., "rate_limited", ..., rate_limited=True)
+#
+# and NEITHER renderer had a formatter for it — the gateway's
+# ``_EVENT_FORMATTERS`` and the TUI's ``_KANBAN_EVENT_FORMATTERS`` both lacked
+# the kind entirely, and it was in no subscriber's kind list either. So a
+# provider quota wall was announced with CRASH-SHAPED copy by the one renderer
+# that could name it (``crashed_cause``), and by NOTHING at all by the other.
+#
+# The irony that proves the gap: the gateway's own ``_fmt_crashed`` docstring
+# documents the distinction ("``rate_limited`` -> a quota wall, which is NOT a
+# failure at all") and ``crashed_cause`` can name it — but that path only
+# fires for a ``crashed`` event, and a rate-limited worker produces a
+# ``rate_limited`` event, NEVER a ``crashed`` one. The code knew the
+# distinction and no renderer ever used it.
+#
+# WHY THE COPY MUST NAME IT A QUOTA WALL AND NOT A FAILURE:
+#
+# The board's ACCOUNTING is already correct — a rate-limited requeue does not
+# touch ``consecutive_failures``, the breaker does not trip, and the cooldown
+# holds. Measured on the live ``gamedev`` board during the 17.8 h dead-quota
+# window (2026-11-01 07:13:42 -> 2026-11-02 00:59:24): 1682 ``rate_limited``
+# events against only 2 ``crashed`` events — a 838:1 ratio. Any reporter that
+# collapses the two kinds describes the outage backwards.
+#
+# So the message must say, truthfully:
+#
+#   * the cause is a QUOTA WALL / provider rate limit, not a crash and not a
+#     worker failure;
+#   * the card was REQUEUED and WILL BE RETRIED, and it did NOT count against
+#     the failure budget (that is what actually happened, and it is what makes
+#     the board's behaviour trustworthy);
+#   * the ACTIONABLE provider hint, when the payload carries one.
+#
+# The wording lives here — in the NEUTRAL module neither renderer owns — so the
+# gateway and the TUI cannot drift apart, the same pattern ``t_fd034683`` used
+# for ``crashed_cause``/``reclaimed_cause``.
+
+# The cause clause. Shared verbatim by both renderers so the copy is
+# byte-identical for the same payload (asserted by a test).
+RATE_LIMITED_CAUSE = "its worker hit a provider quota wall (rate limited)"
+
+# The provider's own actionable hint, when the payload carries one. The worker
+# prints e.g. "Add credits with Custom:Minimax Oauth Fallback. Or switch
+# providers with /model <model> --provider <provider>." — the text that tells
+# the operator what to actually DO. It is only useful if it survives clipping.
+#
+# NOTE (measured 2026-11-02): the live board's 1682 ``rate_limited`` payloads
+# carry NO ``worker_output`` — the producer skips it for rate-limited runs on
+# purpose (``if task_id and not dead.rate_limited``). So this helper is correct
+# and the hint is simply absent on those rows. It is rendered whenever a
+# payload DOES carry one, which is what the acceptance criteria ask for.
+# The provider's ACTIONABLE sentences. These are the calls to action the
+# operator can actually take ("add credits", "switch providers"), not the
+# descriptive ones ("the usage limit has been reached") — the cause clause
+# already names the quota wall, so repeating that is noise.
+#
+# Matched as a SUBSTRING, case-insensitively, so "Add credits with X." and
+# "You can switch providers temporarily with /model ..." both match.
+_RATE_LIMITED_HINT_MARKERS = (
+    "add credit",
+    "buy credit",
+    "update billing",
+    "switch provider",
+    "upgrade your plan",
+)
+
+# The hint is one or two sentences. A hint longer than this is a dump.
+_RATE_LIMITED_HINT_LIMIT = 200
+
+# How much prose may precede the actionable marker inside ONE chunk. The
+# provider's hint is usually its own sentence, but a worker log can glue it
+# to a long lead-in with no punctuation ("...1500 chars of prose Add credits
+# with Foo."). Trimming the front to the marker keeps the INSTRUCTION, which
+# is the whole point of the hint; without it the clip would spend the whole
+# budget on prose and cut the instruction off.
+_RATE_LIMITED_HINT_LEADIN = 24
+
+# A tail-truncated worker log can cut a CSI sequence in half, leaving an
+# orphaned SGR fragment ("205;127;50m") with no ESC prefix. The complete
+# sequence regex above cannot match it, so it would leak into the message as
+# noise. Strip those too — but only a bare parameter run that ends in "m",
+# never ordinary prose ("2067", "model").
+_ORPHAN_SGR_RE = re.compile(r"(?:(?<=\s)|(?<=^))\d+(?:;\d+)*m\b")
+
+
+def rate_limited_hint(payload: Any) -> str:
+    """The actionable provider hint from the payload, clipped; "" when absent.
+
+    The hint is the operator's call to action ("add credits", "switch
+    provider"). It is extracted from ``worker_output`` — the worker's own last
+    words — because that is where the provider puts it.
+
+    Only the ACTIONABLE sentences are returned, not the tail of the raw
+    output: the raw worker output is a rendered panel full of box-drawing
+    chrome and unrelated prose, so returning "the last 160 characters of it"
+    would put noise in the message instead of the instruction.
+
+    Every matching sentence is kept (the provider's hint is usually a PAIR —
+    "Add credits with X. Or switch providers with /model ..." — and dropping
+    half of it would drop half the instruction).
+    """
+    if not isinstance(payload, dict):
+        return ""
+    raw = payload.get("worker_output")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    clean = _ANSI_RE.sub("", raw)
+    clean = _ORPHAN_SGR_RE.sub(" ", clean)
+    # The provider's hint is a sentence of its own. Split on sentence
+    # boundaries so the useful line is not glued to the surrounding ASCII art.
+    flat = " ".join(clean.split())
+    parts: list[str] = []
+    for chunk in re.split(r"(?<=[.!])\s+", flat):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        low = chunk.lower()
+        matched = [m for m in _RATE_LIMITED_HINT_MARKERS if m in low]
+        if not matched:
+            continue
+        # Keep the INSTRUCTION, not the prose in front of it: start the chunk
+        # at the marker so a long lead-in cannot push the actionable words
+        # past the clip budget.
+        start = min(low.index(m) for m in matched)
+        if start > _RATE_LIMITED_HINT_LEADIN:
+            chunk = chunk[start:].lstrip()
+        parts.append(chunk)
+    if not parts:
+        return ""
+    hint = " ".join(parts)
+    if len(hint) > _RATE_LIMITED_HINT_LIMIT:
+        hint = hint[: _RATE_LIMITED_HINT_LIMIT - 1].rstrip() + "…"
+    return hint
+
+
+def rate_limited_cause(payload: Any) -> str:
+    """The cause clause for a ``rate_limited`` notification.
+
+    Names the quota wall and NOTHING else. It never says "crashed", never
+    names a pid or a claimer, and never claims a failure was counted.
+    """
+    return RATE_LIMITED_CAUSE
+
+
+def rate_limited_detail(payload: Any) -> str:
+    """The trailing detail clause for a ``rate_limited`` notification.
+
+    States what actually happened to the card — requeued, will be retried,
+    and NOT counted against the failure budget — plus the actionable provider
+    hint when the payload carries one.
+
+    The requeue/failure-budget clause is NOT optional: it is the part that
+    distinguishes a quota wall from a failure, and the part that makes the
+    board's behaviour (do not trip the breaker on a quota window) legible to
+    the operator.
+
+    The returned clause NEVER ends in a period: each renderer owns the
+    punctuation that follows it, so the gateway's trailing "Logs: ..." and the
+    TUI's bare line cannot double a period, and the two copies stay
+    byte-identical over the shared part.
+    """
+    detail = "it was requeued and will be retried automatically; it does not count as a failure"
+    hint = rate_limited_hint(payload)
+    if hint:
+        # The hint is a sentence and may already end in a period; drop it so
+        # the renderer's own punctuation is the only one.
+        detail += ". " + hint.rstrip(". ")
+    return detail

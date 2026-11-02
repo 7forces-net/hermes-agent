@@ -68,12 +68,70 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
   ['crashed', { titleKey: 'notify.crashedTitle', toast: 'error' }],
   ['gave_up', { titleKey: 'notify.gaveUpTitle', toast: 'error' }],
   ['protocol_violation', { titleKey: 'notify.protocolViolationTitle', toast: 'error' }],
+  ['rate_limited', { titleKey: 'notify.rateLimitedTitle', toast: 'warning' }],
   ['reclaimed', { titleKey: 'notify.reclaimedTitle', toast: 'warning' }],
   ['timed_out', { titleKey: 'notify.timedOutTitle', toast: 'warning' }]
 ])
 
 const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
+
+/* The quota-wall episode filter (client side).
+ *
+ * `rate_limited` is not a one-shot transition: during a provider quota window
+ * the dispatcher requeues the card, it re-spawns, it hits the SAME wall and
+ * books another `rate_limited` event — every ~360 s. Measured on the live
+ * board: 1682 `rate_limited` events against 2 `crashed` events. Toasting
+ * every one of them would be 1682 toasts for ONE condition with ONE remedy
+ * ("add credits").
+ *
+ * The Python side suppresses the continuation events at CLAIM time
+ * (`kanban_db_notify._filter_rate_limited_episodes`), so the gateway and the
+ * TUI never see them. This plugin polls `/events` directly and does NOT go
+ * through that claim path, so it needs its own copy of the rule.
+ *
+ * The rule: a `rate_limited` event is an episode START unless the previous
+ * quota-relevant event for the same task was itself a quota wall (or the
+ * reclaim the cooldown produces). Measured on the live board this is 12
+ * episode starts out of 1680 events. */
+const QUOTA_EPISODE_KINDS = new Set(['rate_limited', 'reclaimed'])
+const lastQuotaEventKindByTask = new Map<string, string>()
+
+/** True when this `rate_limited` event begins a NEW quota-wall episode. */
+function isRateLimitedEpisodeStart(taskId: string): boolean {
+  const previous = lastQuotaEventKindByTask.get(taskId)
+  const isStart = previous === undefined || !QUOTA_EPISODE_KINDS.has(previous)
+  lastQuotaEventKindByTask.set(taskId, 'rate_limited')
+
+  return isStart
+}
+
+/** Record a non-quota event's kind, so the next quota event sees it.
+ *
+ *  ONLY a TERMINAL outcome (a crash, a completion, a timeout) ends the
+ *  episode. The `/events` WebSocket streams EVERY kind — including the
+ *  bookkeeping ones (`spawned`, `claimed`, `heartbeat`, `respawn_guarded`),
+ *  and the dispatcher emits a `spawned`/`claimed` pair for EVERY retry of a
+ *  still-standing wall. So a rule that reset on ANY non-quota event would
+ *  reset on every retry and toast the wall every time.
+ *
+ *  Measured on the live board over the 17.8 h dead-quota window (1682
+ *  `rate_limited` events): resetting on ANY event yields 1682 toasts;
+ *  resetting only on terminal outcomes yields 14 — the same 14 episode
+ *  starts the Python side computes from the run history. */
+function rememberQuotaContext(taskId: string, kind: string): void {
+  if (QUOTA_EPISODE_KINDS.has(kind)) {
+    lastQuotaEventKindByTask.set(taskId, kind)
+
+    return
+  }
+
+  // A terminal outcome (a crash, a completion, a timeout) ENDS the episode.
+  // Bookkeeping kinds (spawned/claimed/heartbeat/...) do NOT.
+  if (TERMINAL_NOTIFY.has(kind)) {
+    lastQuotaEventKindByTask.delete(taskId)
+  }
+}
 
 let rest: Rest | null = null
 let translate: PluginTranslate | null = null
@@ -171,6 +229,14 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     return reclaimedCauseLabel(payload, t)
   }
 
+  if (kind === 'rate_limited') {
+    // A quota wall is NOT a failure and NOT a crash: the dispatcher requeues
+    // the card WITHOUT counting a failure, so the breaker does not trip and
+    // the task is retried. The body says exactly that, plus the operator's
+    // call to action (add credits / switch provider).
+    return t('notify.rateLimitedBody')
+  }
+
   if (kind === 'timed_out') {
     return timedOutCauseLabel(payload, t) ?? t('notify.causeUnknown')
   }
@@ -262,6 +328,20 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
     cursor = ev.id
     seenEventIdByBoard.set(slug, cursor)
     const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
+    const kind = ev.kind ?? ''
+    const taskId = (ev.task_id ?? '').trim()
+
+    // The quota-wall episode filter: only the FIRST event of an episode is
+    // reported. The continuation events of a still-standing provider quota
+    // wall are the same wall, retried — one wall, one toast. Without this the
+    // desktop would toast 1682 times for the 17.8 h dead-quota window.
+    if (kind === 'rate_limited' && !isRateLimitedEpisodeStart(taskId)) {
+      continue
+    }
+
+    if (kind !== 'rate_limited') {
+      rememberQuotaContext(taskId, kind)
+    }
 
     if (spec) {
       try {

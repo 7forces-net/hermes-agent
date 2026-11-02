@@ -318,6 +318,83 @@ def _notify_cursor(
     return None if row is None else int(row["last_event_id"])
 
 
+# --- The quota-wall episode filter -----------------------------------------
+#
+# ``rate_limited`` is NOT a one-shot transition: during a provider quota
+# window the dispatcher requeues the card, it re-spawns, it hits the SAME wall,
+# and it books another ``rate_limited`` event — every ~360 s (the cooldown).
+# Measured on the live ``gamedev`` board during the 17.8 h dead-quota window:
+# 1682 ``rate_limited`` events across 10 cards, against only 2 ``crashed``
+# events. Reporting every one of them would be 1682 notifications and 1682
+# wake turns for ONE condition with ONE remedy ("add credits").
+#
+# The board already distinguishes the episodes: a quota wall that is still
+# going is preceded by another quota wall (or by the reclaim the cooldown
+# produces). A quota wall that has RECOVERED — or that is genuinely new —
+# follows something else: a crash, a timeout, a completion, or the card's
+# first run.
+#
+# So the FIRST event of an episode is the one worth reporting. Measured on
+# the live board, that is 14 of 1682 events (a 120:1 reduction) — and every
+# one of those 14 is a genuine "the wall just started" moment.
+#
+# The filter lives HERE, in the shared claim path, because BOTH renderers
+# (the gateway and the TUI) claim through this function: a filter in one
+# renderer would leave the other to storm.
+
+# Run outcomes that mean "the quota wall is STILL the same episode".
+_EPISODE_CONTINUATION_OUTCOMES = ("rate_limited", "reclaimed")
+
+
+def _is_rate_limited_episode_start(conn: sqlite3.Connection, ev: Any) -> bool:
+    """True when this ``rate_limited`` event begins a NEW quota-wall episode.
+
+    False when the preceding run on this card was itself quota-limited (or was
+    the reclaim the cooldown produces), i.e. the same wall is still up.
+
+    Total by construction: a malformed payload or a missing run must never
+    raise out of a notifier tick. When the evidence is missing the event is
+    treated as an episode START (report it) — a duplicate report is a smaller
+    harm than swallowing the first notice of a wall.
+    """
+    try:
+        task_id = getattr(ev, "task_id", None)
+        run_id = getattr(ev, "run_id", None)
+        if not task_id or run_id is None:
+            return True
+        row = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? AND id < ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if row is None:
+            return True
+        outcome = row["outcome"]
+        return outcome not in _EPISODE_CONTINUATION_OUTCOMES
+    except Exception:
+        # Never let the filter break a tick — report the event.
+        return True
+
+
+def _filter_rate_limited_episodes(conn: sqlite3.Connection, events: list) -> list:
+    """Drop the CONTINUATION events of a quota-wall episode.
+
+    Only the first ``rate_limited`` event of an episode survives; the rest are
+    the same wall, retried. The returned list keeps every other kind intact —
+    the filter is specific to ``rate_limited`` on purpose.
+
+    The suppressed events are still CLAIMED (the cursor advances past them),
+    so they are never re-delivered and never re-examined: the dedup cursor is
+    the mechanism, and this filter only decides what gets SENT.
+    """
+    out: list = []
+    for ev in events:
+        if getattr(ev, "kind", "") == "rate_limited" and not _is_rate_limited_episode_start(conn, ev):
+            continue
+        out.append(ev)
+    return out
+
+
 def unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -365,6 +442,13 @@ def claim_unseen_events_for_sub(
     writer lock and only the first claims a given event range. Callers send the
     events, then leave the cursor or call :func:`rewind_notify_cursor` on
     delivery failure.
+
+    The QUOTA-WALL EPISODE FILTER applies to the returned events: the
+    continuation events of a still-standing provider quota wall are dropped
+    here, so NEITHER renderer (the gateway nor the TUI) reports them. The
+    cursor still advances past them, so a suppressed event is never
+    re-delivered — one wall, one notice. See
+    :func:`_filter_rate_limited_episodes`.
     """
     with _kb.write_txn(conn):
         old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
@@ -377,7 +461,7 @@ def claim_unseen_events_for_sub(
         if not events:
             return old_cursor, old_cursor, []
         _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
-        return old_cursor, new_cursor, events
+        return old_cursor, new_cursor, _filter_rate_limited_episodes(conn, events)
 
 
 def _cas_cursor(conn: sqlite3.Connection, key: tuple, new_cursor: int, expected: int) -> sqlite3.Cursor:

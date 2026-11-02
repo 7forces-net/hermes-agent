@@ -855,3 +855,99 @@ describe('protocol_violation and reclaimed reach the desktop', () => {
     expect(message).not.toContain('\n')
   })
 })
+
+/**
+ * The provider quota wall (`rate_limited`).
+ *
+ * A quota wall is NOT a failure and NOT a crash: the dispatcher requeues the
+ * card WITHOUT counting a failure, so the breaker does not trip and the task
+ * is retried. Measured on the live board over the 17.8 h dead-quota window:
+ * 1682 `rate_limited` events against 2 `crashed` events.
+ *
+ * The storm control is the point of these tests. The `/events` WebSocket
+ * streams EVERY kind — including the bookkeeping ones (`spawned`, `claimed`,
+ * `heartbeat`, `respawn_guarded`) — and the dispatcher emits a
+ * `spawned`/`claimed` pair for EVERY retry of a still-standing wall. So a
+ * rule that resets the episode on ANY non-quota event resets on every retry
+ * and toasts the wall every time: 1682 toasts for one condition.
+ */
+describe('provider quota wall', () => {
+  it('a quota wall is reported as a quota wall, never as a crash', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'rate_limited', { pid: 16932, claimer: 'DESKTOP-7G7SGH3:18860', exit_code: 75 })
+    ])
+
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+    const notify = lastNotify()
+    expect(notify.kind).toBe('warning')
+    expect(notify.message.toLowerCase()).toContain('quota')
+    expect(notify.message.toLowerCase()).not.toContain('crash')
+    // The operator's remedy must be in the message.
+    expect(notify.message.toLowerCase()).toContain('credit')
+    // pid / claimer stay hidden — a pid is noise to a human reader.
+    expect(notify.message).not.toContain('16932')
+    expect(notify.message).not.toContain('DESKTOP-7G7SGH3')
+  })
+
+  it('a standing wall toasts ONCE, not once per retry', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    // The dispatcher requeues and re-spawns; each attempt books a fresh
+    // `rate_limited` event, interleaved with the bookkeeping events the
+    // dispatcher emits for the retry (`spawned` / `claimed`).
+    const events: CompletionEvent[] = []
+    let id = 101
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      events.push(ev(id++, 'spawned', {}, 't_wall'))
+      events.push(ev(id++, 'claimed', {}, 't_wall'))
+      events.push(ev(id++, 'rate_limited', { exit_code: 75 }, 't_wall'))
+    }
+
+    await m.onKanbanEventsFrame('smoke', events)
+
+    // ONE wall, ONE toast — the bookkeeping events must not reset the episode.
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('a wall that RECOVERS is reported again', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'rate_limited', {}, 't_wall')])
+    // The wall lifts and the task crashes for a different reason: a terminal
+    // outcome, so it ends the episode.
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'crashed', { exit_kind: 'nonzero_exit' }, 't_wall')])
+    // A NEW wall later is a new episode and must reach the operator.
+    await m.onKanbanEventsFrame('smoke', [ev(103, 'rate_limited', {}, 't_wall')])
+
+    const quotaToasts = hostMock.notify.mock.calls.filter((call) =>
+      String((call[0] as { message?: string }).message ?? '').toLowerCase().includes('quota')
+    )
+
+    expect(quotaToasts).toHaveLength(2)
+  })
+
+  it('a reclaim does not end the episode — the cooldown keeps the same wall standing', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    // The cooldown produces a `reclaimed` before the next attempt. The wall is
+    // the SAME wall, so the reclaim must not produce a SECOND quota toast.
+    // (The reclaim does produce its own toast — it is a terminal kind — so the
+    // count that matters is the number of QUOTA toasts, not the total.)
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'rate_limited', {}, 't_wall')])
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'reclaimed', {}, 't_wall')])
+    await m.onKanbanEventsFrame('smoke', [ev(103, 'rate_limited', {}, 't_wall')])
+
+    const quotaToasts = hostMock.notify.mock.calls.filter((call) =>
+      String((call[0] as { message?: string }).message ?? '').toLowerCase().includes('quota')
+    )
+
+    expect(quotaToasts).toHaveLength(1)
+  })
+})

@@ -175,6 +175,7 @@ gateway:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"
       crashed:             "crashed (worker exited); dispatcher will retry"
+      rate_limited:        "provider quota wall (rate limited); requeued and will be retried, not counted as a failure"
       reclaimed:           "재획득됨(워커 클레임 만료); 디스패처가 다시 시도합니다"
       protocol_violation: "exited without reporting a result; dispatcher will retry"
       timed_out:           "timed out; dispatcher will retry"

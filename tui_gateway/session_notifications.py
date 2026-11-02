@@ -12,6 +12,8 @@ from hermes_cli.kanban_notice import (
     clip_worker_output as _clip_worker_output,
     crashed_cause as _crashed_cause,
     gave_up_cause as _gave_up_cause,
+    rate_limited_cause as _rate_limited_cause,
+    rate_limited_detail as _rate_limited_detail,
     reclaimed_cause as _reclaimed_cause,
 )
 
@@ -150,7 +152,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
 # ``protocol_violation`` is the reaper's clean-exit crash: it was emitted but never claimed, so a worker that
 # exited without reporting a result stranded the task with no notification at all.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "protocol_violation", "reclaimed")
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "protocol_violation", "reclaimed", "rate_limited")
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0  # /loop and /heartbeat share one idle-poll cadence
 
 
@@ -440,12 +442,40 @@ def _kb_reclaimed(task, payload: dict, title: str) -> str:
     return f" {_reclaimed_cause(payload)}; requeued, dispatcher will retry"
 
 
+def _kb_rate_limited(task, payload: dict, title: str) -> str:
+    """Name the REAL cause of a provider quota wall.
+
+    A quota wall is NOT a crash and NOT a worker failure: the dispatcher
+    requeues a rate-limited worker WITHOUT counting a failure, so the card is
+    retried and the breaker does not trip. The event had NO renderer here at
+    all before, and the kind was in no subscriber's kind list either — so the
+    1682 quota-wall events of the 17.8 h dead-quota window produced ZERO
+    notifications.
+
+    ``rate_limited_cause``/``rate_limited_detail`` own the wording so the
+    gateway and the TUI cannot drift apart (the copy is byte-identical for the
+    same payload). The detail states what actually happened: requeued, will be
+    retried, NOT counted as a failure — plus the actionable provider hint when
+    the payload carries one.
+
+    ``pid``/``claimer`` stay hidden: a pid is noise to a human reader.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    cause = _rate_limited_cause(payload)
+    detail = _rate_limited_detail(payload)
+    return f" {cause}: {detail}"
+
+
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
+# ``rate_limited`` gets its OWN glyph (⏳), not the failure glyph (✖): a
+# provider quota wall is not a failure, and a ✖ next to it says the opposite
+# of what the board actually did.
 _KANBAN_EVENT_FORMATTERS = {
     "completed": ("✔", _kb_completed),
     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
     "gave_up": ("✖", _kb_gave_up),
     "crashed": ("✖", _kb_crashed),
+    "rate_limited": ("⏳", _kb_rate_limited),
     "reclaimed": ("♻", _kb_reclaimed),
     "protocol_violation": ("✖", _kb_protocol_violation),
     "timed_out": ("⏱", _kb_timed_out),
