@@ -143,6 +143,23 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    max_in_progress_reached: Optional[int] = None
+    """The global concurrency cap (``kanban.max_in_progress``) that made this
+    tick's spawn budget ZERO — the host was already running that many
+    workers, so the dispatcher spawned nothing and reported no bucket at
+    all. The value is the CAP, not a count: the operator's lever is the
+    config number. ``None`` when the cap did not bind.
+
+    A board sitting at this cap produced 57% of the live gamedev board's
+    "dispatcher stuck" warnings while every profile was perfectly healthy —
+    the warning sent the operator after venv/PATH/credentials for a
+    condition that had nothing to do with them."""
+    max_spawn_reached: Optional[int] = None
+    """The per-board spawn cap (``kanban.max_spawn``) that made this tick's
+    spawn budget zero. Value is the cap."""
+    max_in_progress_per_profile_reached: Optional[int] = None
+    """The per-profile cap (``kanban.max_in_progress_per_profile``) that held
+    back at least one ready card. Value is the cap."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -154,6 +171,18 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     CLI daemon and the embedded gateway dispatcher, which otherwise report a
     bare zero-spawn count while ``hermes kanban tail`` is the only place the
     guard reason is written (#111910).
+
+    The two CONCURRENCY CAPS are reported here too, and they are not
+    edge cases: on the live gamedev board 57% of the "dispatcher stuck"
+    warnings were the board sitting at ``kanban.max_in_progress`` and a
+    further 5% were the per-profile cap — with every profile healthy. A
+    warning that omits them sends the operator after venv/PATH/credentials
+    for a condition that has nothing to do with them.
+
+    The cap is reported as ``max_in_progress=3`` (the cap the operator
+    configures) rather than a count of running workers: the cap is the
+    lever. ``max_in_progress_per_profile=2`` is reported when the per-profile
+    cap held at least one card back.
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
@@ -168,10 +197,101 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        # Concurrency caps: the value IS the cap, so it is reported as a
+        # key=value pair (max_in_progress=3) rather than a count.
+        if res.max_in_progress_reached is not None:
+            counts["max_in_progress"] = res.max_in_progress_reached
+        if res.max_spawn_reached is not None:
+            counts["max_spawn"] = res.max_spawn_reached
+        if res.max_in_progress_per_profile_reached is not None:
+            counts["max_in_progress_per_profile"] = res.max_in_progress_per_profile_reached
+        if res.skipped_per_profile_capped:
+            counts["skipped_per_profile_capped"] = counts.get("skipped_per_profile_capped", 0) + len(
+                res.skipped_per_profile_capped
+            )
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def describe_cap_pressure(results: Iterable[Optional["DispatchResult"]]) -> str:
+    """One line naming the CONCURRENCY CAP that held the tick back, or ``""``.
+
+    ``max_in_progress=3`` — the board was at its configured global
+    concurrency cap, so the dispatcher correctly spawned nothing and the
+    profiles are fine. ``max_in_progress_per_profile=2`` — the per-profile
+    cap held a card back.
+
+    This is the SIGNAL that the "dispatcher stuck" warning needs in order
+    to stop blaming profile health: a board at its cap is working as
+    configured, not stuck. Empty when no cap bound the tick, in which case
+    the original "check profile health" advice is still the right one.
+    """
+    caps: dict[str, int] = {}
+    for res in results:
+        if res is None:
+            continue
+        if res.max_in_progress_reached is not None:
+            caps["max_in_progress"] = res.max_in_progress_reached
+        if res.max_spawn_reached is not None:
+            caps["max_spawn"] = res.max_spawn_reached
+        if res.max_in_progress_per_profile_reached is not None:
+            caps["max_in_progress_per_profile"] = res.max_in_progress_per_profile_reached
+    return ", ".join(f"{k}={v}" for k, v in sorted(caps.items()))
+
+
+def describe_cap_advice(results: Iterable[Optional["DispatchResult"]]) -> str:
+    """The operator-facing advice for a "dispatcher stuck" warning.
+
+    Returns the CAP wording when a concurrency cap held the tick back, and
+    the original profile-health wording when no cap bound it.
+
+    The cap wording exists because the board-at-its-cap case was 57% of the
+    live gamedev board's 753 "dispatcher stuck" warnings, with every profile
+    healthy: the old wording sent the operator to check venv/PATH/credentials
+    for a condition that has nothing to do with them. Both renderers (the
+    gateway watcher and the standalone daemon) call this so the two copies
+    cannot drift apart.
+    """
+    results = list(results)
+    caps: dict[str, int] = {}
+    for res in results:
+        if res is None:
+            continue
+        if res.max_in_progress_reached is not None:
+            caps["max_in_progress"] = res.max_in_progress_reached
+        if res.max_spawn_reached is not None:
+            caps["max_spawn"] = res.max_spawn_reached
+        if res.max_in_progress_per_profile_reached is not None:
+            caps["max_in_progress_per_profile"] = res.max_in_progress_per_profile_reached
+    if not caps:
+        return (
+            "Check profile health (venv, PATH, credentials), "
+            "`hermes kanban list --status ready` and `hermes kanban list "
+            "--status blocked` for recent spawn_failed tasks."
+        )
+    named = ", ".join(f"{k}={v}" for k, v in sorted(caps.items()))
+    if "max_in_progress" in caps:
+        return (
+            f"The board is at its configured global concurrency cap ({named}) — "
+            f"the dispatcher is working as configured, not broken. Raise "
+            f"kanban.max_in_progress in config.yaml, or wait for a running "
+            f"worker to finish."
+        )
+    if "max_spawn" in caps:
+        return (
+            f"The board is at its configured per-board spawn cap ({named}) — "
+            f"the dispatcher is working as configured, not broken. Raise "
+            f"kanban.max_spawn in config.yaml, or wait for a running worker "
+            f"to finish."
+        )
+    return (
+        f"The assignee is at its configured per-profile concurrency cap ({named}) "
+        f"— the profile is busy, not broken. Raise "
+        f"kanban.max_in_progress_per_profile in config.yaml, or wait for a "
+        f"running worker to finish."
+    )
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1955,6 +2075,10 @@ def _dispatch_lane_task(
         current = per_profile_running.get(assignee, 0)
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
+            # Name the cap that held the card back, so the "dispatcher stuck"
+            # warning can say "the per-profile cap is full" instead of
+            # "check profile health" — the profile is busy, not broken.
+            result.max_in_progress_per_profile_reached = per_profile_cap
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
@@ -2110,12 +2234,18 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # Record WHY the budget was zero. Without this the tick produces
+            # no bucket at all and the "dispatcher stuck" warning prints no
+            # hold reason — the operator is left chasing profile health for
+            # a board that is simply at its configured cap.
+            result.max_spawn_reached = max_spawn
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.max_in_progress_reached = max_in_progress
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

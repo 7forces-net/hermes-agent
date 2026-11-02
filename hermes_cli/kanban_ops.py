@@ -113,6 +113,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "max_in_progress_reached": res.max_in_progress_reached,
+            "max_spawn_reached": res.max_spawn_reached,
+            "max_in_progress_per_profile_reached": res.max_in_progress_per_profile_reached,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -154,6 +157,25 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    if res.max_in_progress_reached is not None:
+        print(
+            f"Deferred: board is at the global concurrency cap "
+            f"(kanban.max_in_progress={res.max_in_progress_reached}) — no workers "
+            f"spawned this tick; the dispatcher is working as configured"
+        )
+    if res.max_spawn_reached is not None:
+        print(
+            f"Deferred: board is at the per-board spawn cap "
+            f"(kanban.max_spawn={res.max_spawn_reached}) — no workers spawned "
+            f"this tick; the dispatcher is working as configured"
+        )
+    if res.max_in_progress_per_profile_reached is not None:
+        print(
+            f"Deferred: at the per-profile concurrency cap "
+            f"(kanban.max_in_progress_per_profile="
+            f"{res.max_in_progress_per_profile_reached}) — the profile is busy, "
+            f"not broken"
+        )
     return 0
 
 
@@ -225,12 +247,11 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             if now - health_state["last_warn_at"] >= 300:
                 held = kbd.describe_suppression([res])
                 held = f" Last tick held back: {held}." if held else ""
+                advice = kbd.describe_cap_advice([res])
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
                     f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
+                    f"successfully.{held} {advice}",
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now
