@@ -356,6 +356,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    reasoning_effort, rc = _parse_effort_flag(getattr(args, "reasoning_effort", None))
+    if rc:
+        return rc
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=args.body, assignee=args.assignee,
@@ -367,6 +370,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=reasoning_effort,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
@@ -512,6 +516,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.reasoning_effort:
+        field("reasoning", task.reasoning_effort)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -591,6 +597,45 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _parse_effort_flag(raw: Optional[str]) -> tuple[Optional[str], int]:
+    """``--reasoning`` / ``set-effort`` level -> ``(level_or_None, rc)``.
+
+    ``None`` means "inherit the profile default" (clear). ``"none"`` is a VALUE
+    (thinking off), not a clear — only an empty value or the explicit
+    ``clear``/``default``/``inherit``/``profile`` words clear the override.
+    Rejects anything outside the shipped ladder with the accepted list, so a
+    typo'd level is never silently written as "use the profile default".
+    """
+    if raw is None:
+        return None, 0
+    value = str(raw).strip()
+    if not value or value.lower() in {"clear", "default", "inherit", "profile"}:
+        return None, 0
+    try:
+        return kb.normalize_reasoning_effort(value), 0
+    except ValueError as exc:
+        return None, _err(f"kanban: --reasoning: {exc}", 2)
+
+
+def _cmd_set_effort(args: argparse.Namespace) -> int:
+    """Set or clear a card's per-task reasoning-effort override."""
+    effort, rc = _parse_effort_flag(getattr(args, "level", None))
+    if rc:
+        return rc
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_reasoning_effort(conn, args.task_id, effort)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if effort:
+        print(f"Set reasoning effort on {args.task_id}: {effort} (applies on next dispatch)")
+    else:
+        print(f"Cleared reasoning effort on {args.task_id} (worker uses its profile default)")
     return 0
 
 
@@ -1281,7 +1326,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "set-effort": _cmd_set_effort,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

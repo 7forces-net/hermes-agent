@@ -239,6 +239,14 @@ DEFAULT_CONFIG = {
         # vision_analyze and prepend the description. vision_analyze stays a tool regardless.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # Profile-wide reasoning depth: "none" | "minimal" | "low" | "medium" | "high" |
+        # "xhigh" | "max" | "ultra" (empty = provider default). Read at runtime by
+        # hermes_constants.resolve_reasoning_config(); declared here so `hermes config set
+        # agent.reasoning_effort <level>` is a recognized key (no --force needed) and
+        # `hermes config check` stops treating it as a missing field. Overridden per model
+        # by ``reasoning_overrides`` below, per run by ``--reasoning``, and per board card by
+        # ``tasks.reasoning_effort`` (the kanban per-card override).
+        "reasoning_effort": "",
         # Model name (any reasonable spelling) -> effort level; overrides agent.reasoning_effort
         # when the current model matches. Edit in config.yaml (no CLI support: dots in keys).
         "reasoning_overrides": {},

@@ -187,6 +187,12 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--reasoning", dest="reasoning_effort", metavar="LEVEL",
+             help="Reasoning effort for this card's worker (none|minimal|low|medium|"
+                  "high|xhigh|max|ultra). Independent of --model: the worker may run "
+                  "the profile's own model at a different depth. Overrides the profile's "
+                  "agent.reasoning_effort for this dispatch only; never written to the "
+                  "profile config. Omit to use the profile default."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -241,6 +247,14 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-effort", [
+        _TASK_ID,
+        _arg("level", nargs="?",
+             help="Reasoning effort for this card's worker "
+                  "(none|minimal|low|medium|high|xhigh|max|ultra), or "
+                  "'clear' to go back to the profile default. "
+                  "Omit the level to clear."),
+    ], help="Set or clear a task's reasoning-effort override (takes effect on the next dispatch)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

@@ -446,12 +446,16 @@ def _run_agent(
     from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
 
     reasoning_config = resolve_reasoning_config(cfg, choice.model)
+    reasoning_effort_override = None
     if reasoning is not None and str(reasoning).strip():
         parsed_reasoning = parse_reasoning_effort(reasoning)
         if parsed_reasoning is None:
             logging.warning("Unknown --reasoning '%s', keeping the configured level", reasoning)
         else:
             reasoning_config = parsed_reasoning
+            # EXPLICIT per-run override: it must outrank the config resolution on the
+            # fallback leg too (a Kanban card's per-card effort rides in as --reasoning).
+            reasoning_effort_override = dict(parsed_reasoning)
 
     # sorted() gives stable ordering for config-derived sets; explicit values preserve user order.
     toolsets_list = _normalize_toolsets(toolsets)
@@ -490,6 +494,7 @@ def _run_agent(
             fallback_model=get_fallback_chain(cfg) or None,
             ephemeral_system_prompt=skills_prompt,
             reasoning_config=reasoning_config,
+            reasoning_effort_override=reasoning_effort_override,
             # The only interactive callback wired: no user sits at a terminal. Sudo prompts gate on
             # HERMES_INTERACTIVE (never set), hook approval via HERMES_ACCEPT_HOOKS=1, dangerous
             # commands via HERMES_YOLO_MODE=1, skill secret capture degrades gracefully.

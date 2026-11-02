@@ -1902,7 +1902,22 @@ def _update_fallback_context_compressor(agent) -> None:
 
 def _reresolve_fallback_reasoning_config(agent) -> None:
     """Per-model override > global reasoning_effort (YAML False = disabled); a config load
-    failure keeps the current reasoning_config rather than killing the swap."""
+    failure keeps the current reasoning_config rather than killing the swap.
+
+    An EXPLICIT per-run override (``--reasoning <level>``, e.g. a Kanban card's
+    ``tasks.reasoning_effort``) outranks the config resolution: it is the operator's
+    instruction for THIS run, so it must survive the swap to the fallback leg.
+    Without this, a per-card ``xhigh`` silently reverted to the profile default the
+    moment the worker failed over -- exactly the leg the card was pinning.
+    """
+    explicit = getattr(agent, "_reasoning_effort_override", None)
+    if isinstance(explicit, dict) and explicit:
+        agent.reasoning_config = dict(explicit)
+        logger.info(
+            "Fallback %s: reasoning_config resolved: %s (explicit per-run override)",
+            agent.model, agent.reasoning_config,
+        )
+        return
     try:
         # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
         # because a config load failure must not kill the swap.

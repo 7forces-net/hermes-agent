@@ -2569,6 +2569,9 @@ class CLICommandsMixin:
                        _dim_line('Display:      show, hide'),
                        _dim_line('Scope:        session-scoped by default, --global to persist'))
         self.reasoning_config = parsed
+        # The session-scoped level is an EXPLICIT override for the rest of this session:
+        # record it so the fallback leg re-resolves to THIS level, not the profile default.
+        self._reasoning_effort_override = dict(parsed)
         self.agent = None  # Force agent re-init with new reasoning config
         saved = explicit_global and _save("agent.reasoning_effort", arg)
         if saved:

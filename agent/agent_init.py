@@ -2202,6 +2202,7 @@ def init_agent(
     event_callback: Optional[Callable[[str, dict], None]] = None,
     reaction_callback: Optional[Callable[[str], None]] = None, max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None, service_tier: str = None,
+    reasoning_effort_override: Dict[str, Any] = None,
     request_overrides: Dict[str, Any] = None, prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None, user_id: str = None, user_id_alt: str = None, user_name: str = None,
     chat_id: str = None, chat_name: str = None, chat_type: str = None, thread_id: str = None,
@@ -2279,6 +2280,12 @@ def init_agent(
 
     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
+    # EXPLICIT per-run reasoning effort (``--reasoning <level>``; a Kanban card's
+    # ``tasks.reasoning_effort`` arrives here as the worker's ``--reasoning``). The
+    # fallback leg re-resolves reasoning_config from config.yaml, which would drop the
+    # operator's instruction; this marker makes the override outrank that resolution on
+    # every leg of THIS run. Never persisted to the profile config.
+    agent._reasoning_effort_override = dict(reasoning_effort_override) if reasoning_effort_override else None
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False

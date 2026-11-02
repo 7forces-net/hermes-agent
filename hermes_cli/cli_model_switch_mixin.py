@@ -183,8 +183,12 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool) -> 
     if parsed is None:
         return
     cli.reasoning_config = parsed
+    # The picked level is an EXPLICIT override for the rest of this session: record it so
+    # the fallback leg re-resolves to THIS level, not the profile default.
+    cli._reasoning_effort_override = dict(parsed)
     if cli.agent is not None:
         cli.agent.reasoning_config = parsed
+        cli.agent._reasoning_effort_override = dict(parsed)
     saved = persist_global and save_config_value("agent.reasoning_effort", effort)
     if saved:
         CLI_CONFIG.setdefault("agent", {})["reasoning_effort"] = effort

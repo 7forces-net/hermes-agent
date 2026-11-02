@@ -181,18 +181,79 @@ class _Trunc(TruncationVerdict):
 
 
 def _abort_reason(agent: Any, content: Any, has_tool_calls: bool) -> Optional[tuple]:
-    """``(vprint, user response, error)`` when continuation must NOT be attempted:
+    """``(vprint, user response, error, kind)`` when continuation must NOT be attempted:
     thinking exhausted the budget (reasoning blocks with no visible text after them —
     ``content=None`` from non-<think> models is normal truncation), or a repetition loop
-    burned the budget on one fragment (reasoning stripped first)."""
+    burned the budget on one fragment (reasoning stripped first).
+
+    ``kind`` is ``"thinking_exhausted"`` or ``"repetition_dominated"`` — the caller uses
+    it to decide whether the abort may be escalated to the fallback chain.
+    """
     if has_tool_calls:
         return None
     if content and _THINK_TAG_RE.search(content) and not agent._has_content_after_think_block(content):
-        return _THINKING_EXHAUSTED
+        return (*_THINKING_EXHAUSTED, "thinking_exhausted")
     visible = agent._strip_think_blocks(content) if isinstance(content, str) else content
     if visible and is_repetition_dominated(visible):
-        return _REPETITION_DOMINATED
+        return (*_REPETITION_DOMINATED, "repetition_dominated")
     return None
+
+
+def _thinking_exhausted_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[TruncationVerdict]:
+    """Thinking-exhaustion → fallback. A model that burned its whole output budget on
+    reasoning and produced no visible text cannot be continued on the SAME leg (the
+    next continuation re-burns the same budget), so the turn is escalated to the next
+    fallback provider instead of being lost.
+
+    Mirrors the content-filter branch: on success roll the partial content back to the
+    last clean turn so the fallback gets a coherent continuation point, then re-issue the
+    call against the new provider. With no fallback available the caller keeps the
+    pre-existing terminal behaviour (the ``_THINKING_EXHAUSTED`` message) EXACTLY.
+
+    ``_fallback_index`` is chain-global state: a failed ``_try_activate_fallback()``
+    can leave it past the end of the chain and silently block every future fallback for
+    the session (the same bug class fixed in ``agent/agent_runtime_helpers.py``). The
+    index is therefore restored when the activation fails, so this call site can never
+    strand it.
+    """
+    agent = st.agent
+    chain = getattr(agent, "_fallback_chain", None) or []
+    if getattr(agent, "_fallback_index", 0) >= len(chain):
+        # Nothing left to switch to: keep the existing terminal behaviour.
+        return None
+    agent._vprint(
+        f"{agent.log_prefix}💭 Reasoning exhausted the output budget — activating fallback provider...",
+        force=True,
+    )
+    agent._emit_status("Reasoning exhausted the output budget; switching to fallback...")
+    # Remember where the chain stood so a failed activation cannot strand the index.
+    _index_before = getattr(agent, "_fallback_index", 0)
+    if not agent._try_activate_fallback():
+        # No fallback could be activated. Restore the chain position so the NEXT turn
+        # (or the next recovery path) can still walk the chain from the start.
+        agent._fallback_index = _index_before
+        agent._vprint(
+            f"{agent.log_prefix}⚠️  No fallback provider available — keeping the "
+            "thinking-exhausted response.",
+            force=True,
+        )
+        return None
+    # Roll partial content back to the last clean turn so the fallback gets a
+    # coherent continuation point; unmark survivors (their text left the partial).
+    if st.truncated_response_parts:
+        st.messages = agent._get_messages_up_to_last_assistant(st.messages)
+    for _frag in st.messages:
+        if isinstance(_frag, dict):
+            _frag.pop("_length_continuation_fragment", None)
+            _frag.pop("_length_continuation_nudge", None)
+    agent._session_messages = st.messages
+    st.length_continue_retries = 0
+    st.truncated_response_parts = []
+    st.retry_count = 0
+    st.compression_attempts = 0
+    _retry.primary_recovery_attempted = False
+    _retry.restart_with_rebuilt_messages = True
+    return st.done("break")
 
 
 def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[TruncationVerdict]:
@@ -418,7 +479,15 @@ def recover_from_truncation(
 
     abort = _abort_reason(agent, _trunc_content, _trunc_has_tool_calls)
     if abort is not None:
-        line, user_response, error = abort
+        line, user_response, error, kind = abort
+        # Thinking exhaustion (reasoning ate the whole output budget, no visible text)
+        # is a PROVIDER-leg failure: the same leg cannot answer it, so escalate to the
+        # fallback chain first. A repetition loop is a MODEL failure and keeps the
+        # existing terminal behaviour.
+        if kind == "thinking_exhausted":
+            escalated = _thinking_exhausted_fallback(st, _retry)
+            if escalated is not None:
+                return escalated
         agent._vprint(f"{agent.log_prefix}{line}", force=True)
         return st.end_turn(user_response, error)
 

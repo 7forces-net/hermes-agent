@@ -2776,12 +2776,17 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         from hermes_constants import resolve_reasoning_config
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         # --reasoning wins for this run only (never persisted); unparseable -> warn and ignore.
+        # The parsed value is ALSO recorded as the run's EXPLICIT override so the fallback
+        # leg re-resolves to THIS level instead of the profile default (a Kanban card's
+        # per-card ``tasks.reasoning_effort`` rides in as ``--reasoning``).
+        self._reasoning_effort_override = None
         if reasoning is not None and str(reasoning).strip():
             _cli_reasoning = _parse_reasoning_config(reasoning)
             if _cli_reasoning is None:
                 logger.warning("Unknown --reasoning '%s', keeping the configured level", reasoning)
             else:
                 self.reasoning_config = _cli_reasoning
+                self._reasoning_effort_override = dict(_cli_reasoning)
         self.service_tier = _parse_service_tier_config(CLI_CONFIG["agent"].get("service_tier", ""))
 
         pr = CLI_CONFIG.get("provider_routing", {}) or {}
