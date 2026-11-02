@@ -185,18 +185,57 @@ class _WindowsSimulator:
     real Windows host, where the module genuinely is not found.
     """
 
+    def __init__(self, blocked):
+        self._blocked = blocked
+
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in BLOCKED_MODULES:
+        if fullname.split(".")[0] in self._blocked:
             raise ModuleNotFoundError("No module named %%r" %% fullname, name=fullname)
         return None
 
 
+# The POSIX-only modules are blocked ONLY while the module under test is
+# being imported -- not for the whole process.
+#
+# Reason: on a POSIX host the STDLIB itself imports them. ``subprocess``
+# does ``import fcntl`` at module level, ``shutil``/``pathlib`` reach for
+# ``posix``-flavoured helpers, and the C accelerator modules do the same.
+# Blocking them globally therefore breaks the standard library rather than
+# the module under test, and every candidate would be reported as broken
+# (182 false positives on Linux, where the guard was first exercised).
+#
+# What matters is whether the TEST MODULE can be imported on Windows, and
+# the module under test is the only thing imported while the block is
+# active. Anything it imports from the stdlib is imported by the stdlib's
+# own code, which on a real Windows host has its own POSIX-free variants --
+# so pre-importing the stdlib under test BEFORE installing the block makes
+# the simulation faithful: the test module's own top-level ``import fcntl``
+# still raises, while the stdlib keeps working.
+#
+# Concretely: the modules already in sys.modules (the stdlib and the
+# repo's own dependencies, imported by the probe itself) stay usable; only a
+# FRESH top-level import of a POSIX-only module raises.
 for _name in list(sys.modules):
     if _name.split(".")[0] in BLOCKED_MODULES:
         del sys.modules[_name]
-sys.meta_path.insert(0, _WindowsSimulator())
 
-# Remove the os attributes Windows does not have.
+# Import the machinery a test module normally needs BEFORE the block goes
+# in, so the block cannot break the stdlib out from under it.
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import pathlib  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import unittest  # noqa: E402
+import warnings  # noqa: E402
+
+# Remove the os attributes Windows does not have. This is safe to do
+# globally: no stdlib module reaches for os.geteuid and friends at import
+# time, and it is exactly the shape of the defect being guarded.
 for _attr in WINDOWS_MISSING_OS_ATTRS:
     try:
         delattr(os, _attr)
@@ -209,38 +248,49 @@ for _index, _rel in enumerate(MODULES):
     _mod_name = "_windows_import_probe_%%d" %% _index
     _status = "ok"
     _detail = ""
+    _simulator = _WindowsSimulator(BLOCKED_MODULES)
+    sys.meta_path.insert(0, _simulator)
     try:
-        _spec = importlib.util.spec_from_file_location(_mod_name, _path)
-        _module = importlib.util.module_from_spec(_spec)
-        sys.modules[_mod_name] = _module
         try:
-            _spec.loader.exec_module(_module)
-        finally:
-            sys.modules.pop(_mod_name, None)
-    except BaseException as _exc:  # noqa: BLE001 - a broken import is data
-        _name = type(_exc).__name__
-        _msg = str(_exc)
-        _missing = getattr(_exc, "name", None)
-        if isinstance(_exc, ImportError) and _missing in BLOCKED_MODULES:
-            _status = "posix-module"
-            _detail = "imports POSIX-only module %%r" %% _missing
-        elif _name == "AttributeError" and "has no attribute" in _msg:
-            _attr = _msg.rsplit("'", 2)[-2] if _msg.count("'") >= 2 else ""
-            if _attr in WINDOWS_MISSING_OS_ATTRS and "module 'os'" in _msg:
-                _status = "posix-os-attr"
-                _detail = "references os.%%s at import time" %% _attr
+            _spec = importlib.util.spec_from_file_location(_mod_name, _path)
+            _module = importlib.util.module_from_spec(_spec)
+            sys.modules[_mod_name] = _module
+            try:
+                _spec.loader.exec_module(_module)
+            finally:
+                sys.modules.pop(_mod_name, None)
+        except BaseException as _exc:  # noqa: BLE001 - a broken import is data
+            _name = type(_exc).__name__
+            _msg = str(_exc)
+            _missing = getattr(_exc, "name", None)
+            if isinstance(_exc, ImportError) and _missing in BLOCKED_MODULES:
+                _status = "posix-module"
+                _detail = "imports POSIX-only module %%r" %% _missing
+            elif _name == "AttributeError" and "has no attribute" in _msg:
+                _attr = _msg.rsplit("'", 2)[-2] if _msg.count("'") >= 2 else ""
+                if _attr in WINDOWS_MISSING_OS_ATTRS and "module 'os'" in _msg:
+                    _status = "posix-os-attr"
+                    _detail = "references os.%%s at import time" %% _attr
+                else:
+                    _status = "other-error"
+                    _detail = "%%s: %%s" %% (_name, _msg)
+            elif _name in ("Skipped", "SkippedException"):
+                # ``pytest.skip(..., allow_module_level=True)`` -- the repo's
+                # canonical pattern for a POSIX-only module. That is a CLEAN
+                # skip, not a broken import.
+                _status = "skipped"
+                _detail = "module-level skip: %%s" %% _msg
             else:
                 _status = "other-error"
                 _detail = "%%s: %%s" %% (_name, _msg)
-        elif _name in ("Skipped", "SkippedException"):
-            # ``pytest.skip(..., allow_module_level=True)`` -- the repo's
-            # canonical pattern for a POSIX-only module. That is a CLEAN
-            # skip, not a broken import.
-            _status = "skipped"
-            _detail = "module-level skip: %%s" %% _msg
-        else:
-            _status = "other-error"
-            _detail = "%%s: %%s" %% (_name, _msg)
+    finally:
+        # The block is scoped to the module under test. Without this the
+        # POSIX-only modules stay unimportable for the rest of the probe,
+        # which on a POSIX host breaks the stdlib for every later module.
+        try:
+            sys.meta_path.remove(_simulator)
+        except ValueError:
+            pass
     results.append({"module": _rel, "status": _status, "detail": _detail})
 
 # Write to a FILE, not stdout: an imported test module may redirect stdout
