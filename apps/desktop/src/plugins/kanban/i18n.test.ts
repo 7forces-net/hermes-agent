@@ -76,6 +76,8 @@ describe('kanban plugin locale parity', () => {
       'notify.causeKilledBySignal',
       'notify.causeExitedWithoutResult',
       'notify.causeQuotaWall',
+      'notify.rateLimitedTitle',
+      'notify.rateLimitedBody',
       'notify.causeUnknown',
       'notify.causeReclaimed',
       'notify.causeReclaimedStale',
