@@ -34,6 +34,21 @@ _LOCKS_DIRNAME = "gateway-locks"
 _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
+
+# Boot-in-progress marker, written before the gateway's heavy startup work so
+# supervision can tell "still booting" from "dead" (see ``write_boot_marker``).
+_BOOT_MARKER_FILENAME = "gateway.booting.json"
+
+# How long a boot marker is trusted before the boot is presumed wedged. A
+# gateway boot on a multi-GB state.db has been measured at ~13 minutes, so the
+# window is generous; past it a supervisor SHOULD take over rather than back off
+# forever, because a marker that outlives its window means the boot is stuck.
+_BOOT_MARKER_MAX_AGE_S = 30 * 60.0
+
+# Returned by ``gateway_slot_is_live`` when the runtime lock is held but the
+# owning process cannot be named (no usable PID record). The lock alone proves
+# a live process owns the slot — the OS releases it when that process dies.
+_BOOT_SLOT_LOCK_HELD_SENTINEL = -1
 _gateway_lock_handle = None
 # Windows byte-range locks are mandatory for other readers: lock a byte well past
 # the JSON payload so status/PID readers can read while another process holds it.
@@ -156,6 +171,11 @@ def scoped_lock_owner_label(record: Optional[dict[str, Any]]) -> Optional[str]:
 
 def _get_pid_path() -> Path:
     return _get_process_hermes_home() / "gateway.pid"
+
+
+def _get_boot_marker_path() -> Path:
+    """Path of the boot-in-progress marker for this home (see ``write_boot_marker``)."""
+    return _get_process_hermes_home() / _BOOT_MARKER_FILENAME
 
 
 def _get_gateway_lock_path(pid_path: Optional[Path] = None) -> Path:
@@ -698,6 +718,138 @@ def acquire_gateway_runtime_lock() -> bool:
     return True
 
 
+def remove_stale_pid_file_for_claim() -> bool:
+    """Unlink a ``gateway.pid`` that names no live gateway. True when a file was removed.
+
+    Needed because the runtime lock is claimed BEFORE the PID file (see
+    ``claim_gateway_boot_slot``). The normal stale-cleanup path only removes a
+    PID file when the lock is INACTIVE — but at claim time the lock is active
+    (ours), so a crashed gateway's leftover PID file would survive and make the
+    O_EXCL write fail, refusing a boot that should succeed.
+
+    A PID file naming a LIVE gateway is never touched: that is a real race and
+    the caller must lose it. "Live" means the PID still exists AND its start
+    time still matches the record (PID-reuse guard) — a record whose PID is gone
+    is stale by definition.
+    """
+    path = _get_pid_path()
+    record = _read_pid_record(path)
+    if record is None:
+        return False
+    if _live_pid_from_record(record) is not None:
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    _clear_running_pid_cache()
+    return True
+
+
+def claim_gateway_boot_slot() -> bool:
+    """Claim THIS home's gateway boot slot before the heavy startup work.
+
+    The boot slot is the runtime lock plus the PID file. Whoever holds it is the
+    one gateway allowed to boot for this HERMES_HOME; every other instance must
+    refuse.
+
+    Claiming this EARLY (before the import graph, the ``state.db`` migration and
+    the adapter connects) is what stops a slow boot from stacking instances. The
+    old order — claim last — left a window of minutes in which N instances were
+    all "starting up" and none of them had claimed anything, so a supervisor
+    could not tell them apart from a dead gateway and kept starting more.
+
+    The claim is a two-step O_EXCL + flock race, and the two steps are taken in
+    the order that makes a lost race safe:
+
+    1. Take the runtime lock (flock). This is atomic and released by the OS when
+       the process dies, so a crashed boot never leaves the home locked.
+    2. Write ``gateway.pid`` with O_EXCL. A file left by a crashed gateway is
+       removed first, but only when it names no LIVE gateway.
+
+    Returns False when another live gateway already owns this home. Never raises.
+    """
+    global _gateway_lock_handle
+    if _gateway_lock_handle is not None:
+        return True
+    try:
+        # A live gateway already owns this home: refuse before touching anything.
+        if is_gateway_runtime_lock_active():
+            return False
+        if not acquire_gateway_runtime_lock():
+            return False
+        # The lock is ours now. A PID file left by a crashed gateway would make
+        # the O_EXCL write fail; a PID file naming a LIVE gateway means we lost
+        # the race and must not clobber it.
+        if not remove_stale_pid_file_for_claim():
+            record = _read_pid_record()
+            if _live_pid_from_record(record) is not None:
+                release_gateway_runtime_lock()
+                return False
+        write_pid_file()
+        return True
+    except FileExistsError:
+        release_gateway_runtime_lock()
+        return False
+    except Exception:
+        logger.debug("Failed to claim the gateway boot slot", exc_info=True)
+        return False
+
+
+def gateway_slot_is_live(pid_path: Optional[Path] = None) -> Optional[int]:
+    """PID of a live process holding this home's gateway slot, or None.
+
+    The supervisor-facing liveness question: "is SOMETHING alive for this
+    HERMES_HOME?" — as opposed to "is a process whose command line looks like a
+    gateway alive?", which is the identity question ``get_running_pid`` asks.
+
+    Three signals, in decreasing strength, any of which is enough:
+
+    1. **The runtime lock is held.** The lock is an OS file lock released when
+       the owning process dies, so "held" means a live process owns the slot
+       with no PID-reuse ambiguity at all.
+    2. **``gateway.pid`` names a live process** (PID exists AND its start time
+       still matches the record — the PID-reuse guard).
+    3. **The boot marker names a live process** (same guard). This is what
+       covers the window before the authoritative PID-file claim.
+
+    Deliberately lenient: a false "alive" only makes a supervisor NOT start a
+    gateway, while a false "dead" makes it start one — and starting a second
+    gateway is the failure this whole mechanism exists to prevent.
+    """
+    resolved_pid_path = Path(pid_path) if pid_path is not None else _get_pid_path()
+    resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
+    # (1) The authoritative signal: an OS lock held by a live process.
+    try:
+        if is_gateway_runtime_lock_active(resolved_lock_path):
+            pid = _live_pid_from_record(_read_pid_record(resolved_pid_path))
+            if pid is not None:
+                return pid
+            # The lock is held but the PID file is missing or stale: the owner is
+            # alive, we just cannot name it. Report the lock holder's record.
+            lock_pid = _live_pid_from_record(_read_gateway_lock_record(resolved_lock_path))
+            if lock_pid is not None:
+                return lock_pid
+            return _BOOT_SLOT_LOCK_HELD_SENTINEL
+    except Exception:
+        logger.debug("Gateway runtime lock probe failed", exc_info=True)
+    # (2) The PID file.
+    try:
+        pid = _live_pid_from_record(_read_pid_record(resolved_pid_path))
+        if pid is not None:
+            return pid
+    except Exception:
+        logger.debug("Gateway PID record probe failed", exc_info=True)
+    # (3) The boot marker.
+    try:
+        pid = _live_pid_from_record(read_boot_marker())
+        if pid is not None:
+            return pid
+    except Exception:
+        logger.debug("Gateway boot marker probe failed", exc_info=True)
+    return None
+
+
 def release_gateway_runtime_lock() -> None:
     """Release the gateway runtime lock when owned by this process."""
     global _gateway_lock_handle
@@ -776,6 +928,97 @@ def write_pid_file() -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json_excl(path, _build_pid_record())
     _clear_running_pid_cache()
+
+
+def write_boot_marker() -> None:
+    """Publish that THIS process is booting a gateway for this HERMES_HOME.
+
+    A gateway's boot is long (the import graph, then a ``state.db`` migration on a
+    multi-GB database) and until it finishes it has no ``gateway.pid`` and no
+    runtime lock — the O_EXCL claim happens only once the gateway is nearly
+    serving. Every liveness probe that reads ``gateway.pid`` therefore sees "no
+    gateway" for the whole boot window and concludes the gateway is dead.
+
+    That is how a 13-minute boot becomes a restart storm: each supervision tick
+    sees an absent ``gateway.pid``, starts another instance, and the instances
+    stack because none of them has claimed the lock yet.
+
+    The boot marker is the missing half of the identity handshake. It is written
+    BEFORE the heavy work and removed when the real ``gateway.pid`` claim lands,
+    so the two never both claim the same home. It is a hint, not an authority:
+    ``get_running_pid`` still ignores it (only the O_EXCL winner is the gateway),
+    and the marker records the boot's start time so a stale marker left by a
+    crashed boot cannot be mistaken for a live one.
+
+    Never raises: a failure to publish the marker must not abort a boot.
+    """
+    path = _get_boot_marker_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            **_build_pid_record(),
+            "phase": "booting",
+            "boot_started_at": _utc_now_iso(),
+        }
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        _write_json_excl(path, payload)
+    except Exception:
+        logger.debug("Failed to write gateway boot marker", exc_info=True)
+    _clear_running_pid_cache()
+
+
+def clear_boot_marker() -> None:
+    """Remove this process's boot marker (the real PID-file claim supersedes it)."""
+    path = _get_boot_marker_path()
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+    _clear_running_pid_cache()
+
+
+def read_boot_marker() -> Optional[dict[str, Any]]:
+    """The boot marker for this home, or None when absent/unreadable.
+
+    Read-only and side-effect free: it never unlinks anything, so a caller can
+    ask "is a boot in progress?" without disturbing the booting process.
+    """
+    return _read_json_file(_get_boot_marker_path())
+
+
+def gateway_boot_in_progress(max_age_s: float = _BOOT_MARKER_MAX_AGE_S) -> bool:
+    """True when a gateway boot for THIS home looks alive and is still within its window.
+
+    "Looks alive" means the recorded PID still exists AND its start time still
+    matches the record (PID-reuse guard) — a marker left behind by a crashed
+    boot names a dead PID and is reported as not-in-progress.
+
+    ``max_age_s`` bounds how long a marker is trusted. A boot that outlives it
+    is treated as not-in-progress: at that point the instance is presumed wedged
+    and a supervisor SHOULD take over, rather than backing off forever. Pass a
+    NEGATIVE value to disable the age limit entirely (trust the marker as long
+    as its process is alive).
+    """
+    record = read_boot_marker()
+    if not isinstance(record, dict):
+        return False
+    pid = _pid_from_record(record)
+    if pid is None or pid <= 0:
+        return False
+    if not _pid_exists(pid):
+        return False
+    recorded_start = record.get("start_time")
+    current_start = _get_process_start_time(pid)
+    if _start_times_conflict(recorded_start, current_start):
+        return False
+    if max_age_s >= 0:
+        started = record.get("boot_started_at")
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(started)).total_seconds()
+        except (TypeError, ValueError):
+            age = 0.0
+        if age > max_age_s:
+            return False
+    return True
 
 
 def _write_json_excl(path: Path, record: dict[str, Any]) -> None:

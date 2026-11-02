@@ -5047,8 +5047,8 @@ def _start_gateway_claim_pid_file() -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
     import atexit
     from gateway.status import (
-        acquire_gateway_runtime_lock, get_running_pid, release_gateway_runtime_lock,
-        remove_pid_file, write_pid_file)
+        acquire_gateway_runtime_lock, clear_boot_marker, get_running_pid,
+        release_gateway_runtime_lock, remove_pid_file, write_pid_file)
     _current_pid = get_running_pid()
     if _current_pid is not None and _current_pid != os.getpid():
         logger.error("Another gateway instance (PID %d) started during our startup. "
@@ -5060,9 +5060,23 @@ def _start_gateway_claim_pid_file() -> bool:
     try:
         write_pid_file()
     except FileExistsError:
-        release_gateway_runtime_lock()
-        logger.error("PID file race lost to another gateway instance. Exiting.")
-        return False
+        # The early boot-slot claim (``hermes_cli.gateway._start_gateway_claim_boot_slot``)
+        # already wrote this process's PID record before the import graph. Re-writing it
+        # with O_EXCL fails by design — the file is OURS. Verify that and continue;
+        # only a PID file naming a DIFFERENT live process is a lost race.
+        from gateway.status import _pid_from_record, _read_pid_record
+        existing = _pid_from_record(_read_pid_record())
+        if existing != os.getpid():
+            release_gateway_runtime_lock()
+            logger.error("PID file race lost to another gateway instance. Exiting.")
+            return False
+    # The PID-file claim supersedes the boot marker: from here on this process IS
+    # the gateway and ``gateway.pid`` is the authoritative liveness signal. Leaving
+    # the marker behind would make a watcher think a boot were still running.
+    try:
+        clear_boot_marker()
+    except Exception:
+        logger.debug("Failed to clear gateway boot marker", exc_info=True)
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
     return True
@@ -5364,6 +5378,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
     if not _start_gateway_claim_pid_file():
         return False
+
+    # The boot slot (runtime lock + PID file) may still be unclaimed when this
+    # process is a `--replace` boot: ``hermes_cli.gateway._start_gateway_claim_boot_slot``
+    # deliberately skips the early claim for `--replace`, because the running
+    # gateway has to be terminated first and the lock must not be held against
+    # our own replacement path. Now that the old instance is gone, take the slot
+    # so the boot is visible to liveness probes for the rest of startup.
+    try:
+        from gateway.status import owns_gateway_runtime_lock
+        if not owns_gateway_runtime_lock():
+            from gateway.status import claim_gateway_boot_slot
+            claim_gateway_boot_slot()
+    except Exception:
+        logger.debug("Late gateway boot-slot claim failed (non-fatal)", exc_info=True)
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
