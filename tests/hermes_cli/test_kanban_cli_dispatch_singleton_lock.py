@@ -576,6 +576,52 @@ def test_a_second_process_sees_the_cli_lock_as_held(kanban_home, clean_process_l
     )
 
 
+def test_the_gateway_the_cli_and_the_watchdog_all_contend(
+    kanban_home, clean_process_lock,
+):
+    """Every dispatch path on the host must exclude the others.
+
+    Three separate code paths can dispatch on this machine:
+
+    * the gateway's embedded dispatcher (``gateway/kanban_watchers.py``)
+    * the one-shot ``hermes kanban dispatch`` (this card)
+    * the repo-side watchdog (``hermes_cli/kanban_watchdog.py``, a
+      concurrent card) — which delegates to
+      ``gateway.kanban_watchers_common._acquire_singleton_lock``
+
+    They must all contend on the SAME file. The watchdog resolves its own
+    path through ``kb.kanban_home()``, so this test pins that it agrees
+    with the CLI and the gateway — a different path would mean two
+    independent locks wearing one name.
+    """
+    from gateway.kanban_watchers_common import _acquire_singleton_lock
+
+    real_path = kdl.dispatcher_lock_path()
+
+    cli_handle, cli_state = kdl.acquire_dispatcher_lock(real_path)
+    try:
+        assert cli_state == "held"
+
+        gw_handle, gw_state = _acquire_singleton_lock(real_path)
+        assert gw_state == "contended"
+        assert gw_handle is None
+
+        # The watchdog must agree on the path AND the lock.
+        try:
+            from hermes_cli import kanban_watchdog as kw
+        except ImportError:
+            pytest.skip("hermes_cli.kanban_watchdog not present in this tree")
+
+        cm = kw._singleton_dispatcher_lock()
+        wd_handle, wd_state = cm.__enter__()
+        try:
+            assert wd_state == "contended"
+        finally:
+            cm.__exit__(None, None, None)
+    finally:
+        kdl.release_dispatcher_lock(cli_handle)
+
+
 def test_the_lock_is_free_again_after_the_cli_exits(kanban_home, monkeypatch, clean_process_lock):
     """After the CLI's process exits, a second process must get the lock."""
     repo_root = Path(__file__).resolve().parents[2]
