@@ -1684,6 +1684,93 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return label or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
 
 
+def _fallback_leg_unavailable_reason(fb_provider: str) -> str:
+    """Explain WHY a fallback leg could not be built, in operator-actionable terms.
+
+    ``resolve_provider_client()`` returns ``None`` for several very different
+    situations, and the caller used to log one flat "provider not configured"
+    for all of them. That message reads like a config mistake and sends the
+    operator to edit config.yaml, while the two most common causes live in
+    auth.json and need a completely different response:
+
+    * ``never_configured`` — no credential for this provider exists anywhere
+      (neither the profile's auth.json nor the global-root fallback). The fix
+      is to provision one, or to drop the leg from the chain.
+    * ``credentials_expired`` — a credential exists but its access token is
+      past its expiry, so the pool refuses to select it. The fix is to refresh
+      the grant, not to reconfigure the provider.
+    * ``credentials_exhausted`` — the credential exists and is not expired, but
+      the pool has marked it exhausted/dead (quota burned, grant revoked). The
+      fix is to clear the exhaustion state or add another credential.
+    * ``provider_unknown`` — the provider id is not a known provider at all.
+    * ``unavailable`` — anything else (a client that could not be constructed).
+
+    The three credential states are distinguished because each needs a
+    different operator action; collapsing them into one message is what made
+    an expired OAuth grant read as a missing provider for 57 days.
+
+    Never returns or logs a secret value — only key names, expiry timestamps
+    and status labels.
+    """
+    normalized = (fb_provider or "").strip().lower()
+    try:
+        from hermes_cli.auth import get_provider_auth_state
+        state = get_provider_auth_state(normalized) or {}
+    except Exception as exc:
+        return f"unavailable (credential state unreadable: {type(exc).__name__})"
+
+    tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else {}
+    has_token = any(
+        isinstance(tokens.get(key), str) and tokens.get(key).strip()
+        for key in ("access_token", "refresh_token")
+    )
+    if not has_token:
+        # No credential block at all for this provider.
+        return "never_configured (no credential for this provider; provision one or remove the leg)"
+
+    # A credential block exists. Decide whether the access token is expired.
+    expired = False
+    expires_at = None
+    access_token = tokens.get("access_token")
+    if isinstance(access_token, str) and access_token.strip():
+        try:
+            import base64
+            payload = access_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            expires_at = claims.get("exp")
+            if expires_at:
+                expired = time.time() > float(expires_at)
+        except Exception:
+            # Non-JWT token or undecodable payload — treat as not expired.
+            expired = False
+
+    try:
+        from agent.credential_pool import load_pool
+        pool = load_pool(normalized)
+        entry = pool.select() if pool is not None else None
+    except Exception:
+        entry = None
+
+    if expired:
+        stamp = ""
+        if expires_at:
+            try:
+                stamp = f" (access token expired {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(float(expires_at)))})"
+            except Exception:
+                stamp = ""
+        return (
+            "credentials_expired (an expired credential is on file for this provider"
+            f"{stamp}; refresh the grant - the provider IS configured)"
+        )
+    if entry is None:
+        return (
+            "credentials_exhausted (a credential exists but the pool marked it "
+            "exhausted/dead; clear the exhaustion state or add another credential)"
+        )
+    return "unavailable (credential present and selectable, but the client could not be built)"
+
+
 def _is_anthropic_wire_url(url: str) -> bool:
     """Same Messages-only host match as determine_api_mode() / _detect_api_mode_for_url(): api.anthropic.com,
     a /anthropic suffix, or Kimi Code's api.kimi.com/coding (its /chat/completions 404s — #77256)."""
@@ -1899,7 +1986,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_client, _resolved_fb_model = resolve_provider_client(
                 fb_provider, model=fb_model, raw_codex=True, explicit_base_url=fb_base_url_hint, explicit_api_key=fb_api_key_hint, api_mode=fb_api_mode)
             if fb_client is None:
-                logger.warning("Fallback to %s failed: provider not configured", fb_provider)
+                logger.warning(
+                    "Fallback to %s failed: %s",
+                    fb_provider, _fallback_leg_unavailable_reason(fb_provider),
+                )
                 unavailable.add(fb_key)
                 continue
             try:
