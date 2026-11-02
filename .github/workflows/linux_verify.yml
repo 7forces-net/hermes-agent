@@ -92,13 +92,18 @@ jobs:
         # The acceptance criterion is that os.geteuid() == 0 still skips the
         # permission tests on Linux. Run the module as root in a container
         # and confirm the skip reason is the ROOT one, not a Windows one.
+        #
+        # The container installs the module's import-chain dependencies
+        # (pyyaml via hermes_cli.config, httpx for doctor_connectivity) --
+        # without them the module fails at COLLECTION for a reason that has
+        # nothing to do with the root skip, which would mask the real signal.
         run: |
           set -uo pipefail
           docker run --rm -v "$PWD:/w" -w /w \
             python:3.11-slim \
             sh -c '
-              pip install --no-cache-dir -q pytest >/dev/null 2>&1
-              python -m pytest tests/hermes_cli/test_doctor_journal_modes.py -rA --tb=line 2>&1 | tail -40
+              pip install --no-cache-dir -q pytest pyyaml httpx psutil >/dev/null 2>&1
+              python -m pytest tests/hermes_cli/test_doctor_journal_modes.py -rA --tb=line 2>&1 | tail -50
             ' > /tmp/root-run.txt 2>&1 || true
           cat /tmp/root-run.txt
           echo "---- root-skip evidence ----"
