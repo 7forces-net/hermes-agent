@@ -215,6 +215,15 @@ class _WindowsSimulator:
 # Concretely: the modules already in sys.modules (the stdlib and the
 # repo's own dependencies, imported by the probe itself) stay usable; only a
 # FRESH top-level import of a POSIX-only module raises.
+#
+# The POSIX-only modules are dropped from sys.modules BOTH before and after
+# the stdlib is pre-imported. The second drop matters: on a POSIX host the
+# stdlib pulls them in transitively (``subprocess`` does ``import fcntl`` at
+# module level), and a module already in sys.modules is returned without
+# consulting the finder -- so the test module's own ``import fcntl`` would
+# silently succeed and the guard would never fire. (Found by the guard's own
+# regression tests on Linux: the "must fire" cases passed on Windows and
+# failed on Linux.)
 for _name in list(sys.modules):
     if _name.split(".")[0] in BLOCKED_MODULES:
         del sys.modules[_name]
@@ -232,6 +241,13 @@ import threading  # noqa: E402
 import time  # noqa: E402
 import unittest  # noqa: E402
 import warnings  # noqa: E402
+
+# Drop them again: the stdlib above may have pulled them in. The stdlib
+# keeps working (it holds direct references to the module objects), while a
+# fresh top-level import by the module under test now raises.
+for _name in list(sys.modules):
+    if _name.split(".")[0] in BLOCKED_MODULES:
+        del sys.modules[_name]
 
 # ── make the host LOOK like Windows ─────────────────────────────────────────
 # The simulation has to fake the host, not just the module table. A module
