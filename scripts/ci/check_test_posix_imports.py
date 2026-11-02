@@ -286,6 +286,16 @@ for _name in list(sys.modules):
 # so the module failed to import for the wrong reason and the guard reported
 # the wrong verdict. (Found by the guard's own regression tests on Linux.)
 #
+# It IS faked while the module under test is imported, though -- see the
+# import loop below. A module that guards itself with
+# ``sys.platform == "win32" or os.geteuid() == 0`` relies on the short
+# circuit to reach the Windows branch; on a Linux runner ``sys.platform``
+# stayed "linux", so the ``os.geteuid()`` half WAS evaluated and the guard
+# reported a defect that does not exist on a real Windows host. Faking it
+# for the duration of the module's own import gives the module the same
+# answer a real Windows host gives it, while the stdlib -- which has
+# already been imported above -- keeps the host's real platform.
+#
 # ``os.name`` IS faked globally, but that has one consequence: ``pathlib``
 # resolves ``PurePath`` to ``PureWindowsPath`` when ``os.name == "nt"``, and
 # a PureWindowsPath cannot be instantiated on a POSIX host. So the Windows
@@ -295,6 +305,7 @@ for _name in list(sys.modules):
 # The POSIX-only MODULES are removed from ``sys.modules``, which is what
 # makes ``import termios`` fail the way it does on Windows.
 _REAL_OS_NAME = os.name
+_REAL_SYS_PLATFORM = sys.platform
 _REAL_PURE_PATH = None
 if MODE == "simulate":
     os.name = "nt"
@@ -351,7 +362,19 @@ for _index, _rel in enumerate(MODULES):
             _module = importlib.util.module_from_spec(_spec)
             sys.modules[_mod_name] = _module
             try:
-                _spec.loader.exec_module(_module)
+                # Fake sys.platform for the duration of THIS module's import,
+                # so a module that guards a POSIX-only reference with
+                # ``sys.platform == "win32" or <posix ref>`` takes the
+                # Windows branch -- exactly as it would on a real Windows
+                # host. The stdlib was imported above (with the real
+                # platform), so faking it here cannot break it.
+                if MODE == "simulate":
+                    sys.platform = "win32"
+                try:
+                    _spec.loader.exec_module(_module)
+                finally:
+                    if MODE == "simulate":
+                        sys.platform = _REAL_SYS_PLATFORM
             finally:
                 sys.modules.pop(_mod_name, None)
         except BaseException as _exc:  # noqa: BLE001 - a broken import is data
@@ -398,6 +421,7 @@ with open(RESULTS_PATH, "w", encoding="utf-8") as _fh:
 # Restore the real host before exiting, so nothing downstream of this probe
 # in the same process sees a faked platform.
 os.name = _REAL_OS_NAME
+sys.platform = _REAL_SYS_PLATFORM
 if _REAL_PURE_PATH is not None:
     _pathlib.PurePath = _REAL_PURE_PATH
 '''

@@ -234,7 +234,15 @@ def test_does_not_fire_on_an_os_name_guarded_reference(tmp_path):
 
 
 def test_does_not_fire_on_a_sys_platform_guarded_reference(tmp_path):
-    """``sys.platform == "win32" or os.geteuid() == 0`` also short-circuits."""
+    """``sys.platform == "win32" or os.geteuid() == 0`` also short-circuits.
+
+    This one is the guard's own Linux-vs-Windows trap. On a Windows host
+    ``sys.platform`` really is "win32", so the short circuit happens on its
+    own and the case passes. On a LINUX runner it does not: unless the
+    simulation presents the module under test with the Windows platform,
+    the ``os.geteuid()`` half IS evaluated and the guard reports a defect
+    that does not exist on a real Windows host.
+    """
     _write(
         tmp_path,
         "test_ok.py",
@@ -245,6 +253,31 @@ def test_does_not_fire_on_a_sys_platform_guarded_reference(tmp_path):
         "\n"
         "\n"
         '@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="POSIX mode bits")\n'
+        "def test_x():\n"
+        "    pass\n",
+    )
+
+    result = _run(str(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_simulation_does_not_leak_a_faked_platform(tmp_path):
+    """The faked ``sys.platform`` must not escape the module's own import.
+
+    It is faked only while the module under test is imported, because the
+    stdlib branches on it (asyncio, psutil) and a globally faked platform
+    breaks the stdlib out from under the module. So the probe must hand the
+    module back a host it can trust.
+    """
+    _write(
+        tmp_path,
+        "test_sees_the_platform.py",
+        "import sys\n"
+        "\n"
+        "SEEN = sys.platform\n"
+        "\n"
+        "\n"
         "def test_x():\n"
         "    pass\n",
     )
