@@ -179,6 +179,20 @@ jobs:
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
 
+      # A test module that cannot be imported on Windows is a pytest
+      # COLLECTION error, and a collection error INTERRUPTS the whole run:
+      # pytest exits 2 having collected and executed ZERO tests. So a full
+      # suite run on Windows can look green while testing nothing.
+      #
+      # CI never caught it: the main tests lane is Linux-only, and the
+      # Windows lane narrows which FILES it imports (by OS marker) before
+      # selecting with -m — so an unmarked module with a POSIX-only
+      # import-time reference was never imported by either lane. This check
+      # imports every candidate under a simulated Windows host, so the
+      # defect is caught on the Linux runner.
+      - name: Test modules must import on Windows
+        run: python scripts/ci/check_test_posix_imports.py --all
+
       # The Sep 2026 decomposition kept old import paths alive for external plugins
       # (PLUGIN-COMPAT blocks, see COMPAT_MANIFEST.md). They are removed on schedule by
       # reverting one commit, so in-tree code must never depend on them.

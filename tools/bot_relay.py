@@ -440,16 +440,16 @@ def delivery_env(author: Optional[dict], profile_home: "str | Path | None" = Non
 
 # Two deliveries into the SAME profile must never run Bot Chat turns concurrently.
 # Deliveries are separate ``hermes`` subprocesses, so the lock is a per-profile
-# lockfile under ``<root>/bot_relay/locks/`` held with ``fcntl.flock`` for exactly
-# the turn window; the kernel releases it on fd close (incl. process death), so a
-# crashed turn can never wedge the profile.
+# lockfile under ``<root>/bot_relay/locks/`` held with an exclusive OS lock for
+# exactly the turn window; the kernel releases it on handle close (incl. process
+# death), so a crashed turn can never wedge the profile.
 
 
 # ── per-profile turn lock (#93091) ─────────────────────────────────────────── Two deliveries into the SAME
 # target profile must never run their Bot Chat turns concurrently: deliveries spawn separate ``hermes``
 # subprocesses, so an in-memory mutex is useless — the lock is a per-profile lockfile under
-# ``<root>/bot_relay/locks/`` held with ``fcntl.flock`` for exactly the turn execution window. flock is
-# released by the kernel when the holder's fd closes (including process death), so a crashed turn can never
+# ``<root>/bot_relay/locks/`` held with an exclusive OS lock for exactly the turn execution window. The lock is
+# released by the kernel when the holder's handle closes (including process death), so a crashed turn can never
 # wedge the profile. A queued delivery waits up to ``bot_mode.turn_wait_seconds`` and then fails with a
 # structured 'target_busy' refusal instead of blocking forever.
 class TurnBusyError(RuntimeError):
@@ -480,40 +480,116 @@ def turn_lock_path(root: Path | str, profile: str) -> Path:
     return relay_root(root) / LOCKS_DIR / f"{safe}.lock"
 
 
+# ── exclusive lock primitives ───────────────────────────────────────────────
+# One semantics, two implementations: an exclusive lock on a lockfile that
+# (a) fails immediately when someone else holds it, (b) is released by the
+# kernel when the holder's handle closes — including on process death — and
+# (c) is visible across processes AND across threads of one process.
+#
+# POSIX: ``fcntl.flock`` on the whole file.
+# Windows: a 1-byte ``msvcrt.locking`` range at offset 0. ``msvcrt.locking``
+# fails with PermissionError (errno 13) when the range is held by anyone,
+# which is the same "busy" signal flock's LOCK_NB gives. The byte range is
+# locked on the file itself, so a second handle — in this process or another
+# — contends, and closing the holder's handle releases it, matching flock.
+#
+# The Windows idiom (seek to 0, lock one byte) is the same one
+# ``agent/trajectory.py`` already uses for its cross-process append lock.
+
+
+def _open_turn_lockfile(path: Path) -> int:
+    """Open the per-profile lockfile for an exclusive lock.
+
+    ``os.open`` returns a non-inheritable handle on Windows (and O_CLOEXEC
+    semantics on POSIX), so a spawned child does not silently keep the lock
+    after the holder exits.
+    """
+    return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def _try_acquire(handle: int) -> bool:
+    """Try once to take the exclusive lock. True when acquired.
+
+    Never blocks: a busy lock fails immediately so the caller can re-check
+    its deadline.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        # msvcrt.locking locks from the CURRENT file position, and advances
+        # it by the locked length — so the position is reset before every
+        # attempt, or the second attempt would target the wrong range.
+        os.lseek(handle, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _release(handle: int) -> None:
+    """Release an exclusive lock taken by :func:`_try_acquire`."""
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | None = None) -> Iterator[Path]:
     """Hold ``profile``'s cross-process turn lock for the ``with`` body: non-blocking
-    flock probe + short-sleep retry up to the budget (``bot_mode.turn_wait_seconds``
+    lock probe + short-sleep retry up to the budget (``bot_mode.turn_wait_seconds``
     unless ``timeout_seconds``); raises :class:`TurnBusyError` when exhausted. No
-    ordering among waiters, but every waiter is bounded. Without ``fcntl`` (Windows)
-    the lock is a no-op — those installs never had this race path."""
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover — Windows
-        logger.debug("bot turn lock disabled: fcntl unavailable on this platform")
-        yield turn_lock_path(root, profile)
-        return
+    ordering among waiters, but every waiter is bounded.
 
+    The lock is an exclusive OS lock on a per-profile lockfile: ``fcntl.flock``
+    on POSIX, a 1-byte ``msvcrt.locking`` range on Windows. Both are released
+    by the kernel when the holder's handle closes, including on process death,
+    so a crashed turn can never wedge the profile.
+
+    Windows is NOT a no-op here. Deliveries into one profile run as separate
+    ``hermes`` subprocesses on the board's Windows workers, so the race this
+    lock exists to prevent was live exactly where it could not be observed;
+    the 'target_busy' refusal was unreachable there too. ``msvcrt.locking``
+    reproduces flock's semantics (non-blocking failure, cross-process and
+    same-process contention, release on close), verified by
+    ``tests/tools/test_bot_turn_lock.py``.
+    """
     budget = turn_wait_seconds() if timeout_seconds is None else max(0.0, float(timeout_seconds))
     path = turn_lock_path(root, profile)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+    handle = _open_turn_lockfile(path)
     try:
         start = time.monotonic()
         deadline = start + budget
         while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _try_acquire(handle):
                 break
-            except OSError:
-                now = time.monotonic()
-                if now >= deadline:
-                    raise TurnBusyError(profile, now - start)
-                time.sleep(min(0.1, max(0.005, deadline - now)))
+            now = time.monotonic()
+            if now >= deadline:
+                raise TurnBusyError(profile, now - start)
+            time.sleep(min(0.1, max(0.005, deadline - now)))
         try:
             yield path
         finally:
-            with contextlib.suppress(OSError):  # kernel releases on close anyway
-                fcntl.flock(fd, fcntl.LOCK_UN)
+            # The kernel releases on close anyway; the explicit unlock keeps
+            # the release prompt on both platforms.
+            with contextlib.suppress(OSError):
+                _release(handle)
     finally:
-        os.close(fd)
+        os.close(handle)

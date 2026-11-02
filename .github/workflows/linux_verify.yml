@@ -1,0 +1,131 @@
+name: Linux verify (turn-lock + doctor journal modes)
+
+# A focused Linux verification of the Windows collection fix:
+#   tests/hermes_cli/test_doctor_journal_modes.py
+#   tests/tools/test_bot_turn_lock.py
+#   tools/bot_relay.py
+#
+# The fix must make both modules importable on Windows WITHOUT turning their
+# Linux assertions into skips. This job proves the Linux side still runs the
+# REAL tests: it asserts they are collected AND executed, and that none of
+# them is skipped.
+#
+# It also runs the new Windows-import guard on Linux, which is where the
+# guard lives in CI.
+
+on:
+  push:
+    branches: ['kanban/windows-collection-fix']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: "Linux - the fixed modules still run"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: The two modules COLLECT on Linux (no collection error)
+        run: |
+          set -uo pipefail
+          uv run --no-sync python -m pytest \
+            tests/hermes_cli/test_doctor_journal_modes.py \
+            tests/tools/test_bot_turn_lock.py \
+            --collect-only -q
+
+      - name: The two modules RUN on Linux (real assertions, not skips)
+        # -rA prints every test's outcome. The guard below fails the job if
+        # any of the tests was SKIPPED -- a fix that made the module
+        # importable on Windows by skipping it on Linux would fail here.
+        run: |
+          set -uo pipefail
+          uv run --no-sync python -m pytest \
+            tests/hermes_cli/test_doctor_journal_modes.py \
+            tests/tools/test_bot_turn_lock.py \
+            -v -rA --tb=short | tee /tmp/linux-run.txt
+          echo "---- outcome histogram ----"
+          grep -oE "(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)" /tmp/linux-run.txt | sort | uniq -c
+
+      - name: No test in those modules may be SKIPPED on Linux
+        # The root-skip semantics must survive: on a NON-root Linux runner
+        # the permission tests must RUN (not be skipped), and the lock tests
+        # must never be skipped at all.
+        run: |
+          set -uo pipefail
+          skipped=$(grep -c "SKIPPED" /tmp/linux-run.txt || true)
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::$skipped test(s) were SKIPPED on Linux -- the fix must not turn Linux assertions into skips"
+            grep "SKIPPED" /tmp/linux-run.txt
+            exit 1
+          fi
+          echo "no skips on Linux -- every test ran"
+
+      - name: The root-skip still works on a ROOT Linux container
+        # The acceptance criterion is that os.geteuid() == 0 still skips the
+        # permission tests on Linux. Run the module as root in a container
+        # and confirm the skip reason is the ROOT one, not a Windows one.
+        run: |
+          set -uo pipefail
+          docker run --rm -v "$PWD:/w" -w /w \
+            python:3.11-slim \
+            sh -c '
+              pip install --no-cache-dir -q pytest >/dev/null 2>&1
+              python -m pytest tests/hermes_cli/test_doctor_journal_modes.py -rA --tb=line 2>&1 | tail -40
+            ' > /tmp/root-run.txt 2>&1 || true
+          cat /tmp/root-run.txt
+          echo "---- root-skip evidence ----"
+          if grep -q "root ignores file permissions" /tmp/root-run.txt; then
+            echo "OK: the root skip reason is reported on a root Linux container"
+          else
+            echo "::error::expected the root skip reason on a root container"
+            exit 1
+          fi
+          # And it must NOT claim a Windows reason.
+          if grep -qi "chmod is a no-op on Windows" /tmp/root-run.txt; then
+            echo "::error::a Windows skip reason appeared on Linux"
+            exit 1
+          fi
+
+      - name: The Windows-import guard passes on Linux
+        run: uv run --no-sync python scripts/ci/check_test_posix_imports.py --all
+
+      - name: The guard's own regression tests pass on Linux
+        run: uv run --no-sync python -m pytest tests/ci/test_check_test_posix_imports.py -q
+
+      - name: The bot-relay siblings still pass on Linux
+        run: |
+          set -uo pipefail
+          uv run --no-sync python -m pytest \
+            tests/tools/test_bot_relay.py \
+            tests/tools/test_bot_mode_dm.py \
+            tests/tools/test_bot_relay_windows_paths.py \
+            tests/tui_gateway/test_bot_relay_methods.py \
+            -q --tb=short
