@@ -1,0 +1,126 @@
+name: Linux diagnose posix-import guard
+
+# A diagnostic job for the Windows-import guard's Linux behaviour.
+# Prints the state the guard depends on, so the failures are explained by
+# data rather than by reasoning about Python's import machinery.
+
+on:
+  push:
+    branches: ['kanban/windows-collection-fix']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: "Diagnose the guard on Linux"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.9.28"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Diagnose os.geteuid deletion
+        run: uv run --no-sync python diag_linux_geteuid.py
+
+      - name: Diagnose the guard on a geteuid module
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os, sys, importlib.util
+
+          BLOCKED = ("fcntl", "termios", "tty", "pwd", "grp", "resource", "posix", "syslog")
+          REPO = os.getcwd()
+
+          class Sim:
+              def find_spec(self, fullname, path=None, target=None):
+                  if fullname.split(".")[0] in BLOCKED:
+                      raise ModuleNotFoundError("No module named %r" % fullname, name=fullname)
+                  return None
+
+          import pathlib, subprocess, tempfile, threading, time, unittest, warnings, json
+
+          for n in list(sys.modules):
+              if n.split(".")[0] in BLOCKED:
+                  del sys.modules[n]
+
+          os.name = "nt"
+          pathlib.PurePath = pathlib.PureWindowsPath
+          for a in ("geteuid", "getegid", "getuid", "getgid"):
+              try:
+                  delattr(os, a)
+              except AttributeError:
+                  pass
+
+          print("os.name:", os.name)
+          print("hasattr(os, 'geteuid'):", hasattr(os, "geteuid"))
+
+          src = (
+              "import os\n"
+              "import pytest\n"
+              "\n"
+              "\n"
+              "class T:\n"
+              '    @pytest.mark.skipif(os.geteuid() == 0, reason="root")\n'
+              "    def test_x(self):\n"
+              "        pass\n"
+          )
+          import tempfile as tf
+          with tf.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+              fh.write(src)
+              p = fh.name
+          sim = Sim()
+          sys.meta_path.insert(0, sim)
+          try:
+              spec = importlib.util.spec_from_file_location("_probe", p)
+              m = importlib.util.module_from_spec(spec)
+              sys.modules["_probe"] = m
+              spec.loader.exec_module(m)
+              print("IMPORT OK (guard would NOT fire)")
+          except BaseException as e:
+              print("IMPORT FAILED:", type(e).__name__, e)
+              import traceback
+              traceback.print_exc()
+          finally:
+              try:
+                  sys.meta_path.remove(sim)
+              except ValueError:
+                  pass
+          PY
+
+      - name: Show what the guard's own probe sees
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os, sys
+          REPO = os.getcwd()
+          sys.path.insert(0, os.path.join(REPO, "scripts", "ci"))
+          import check_test_posix_imports as C
+          import tempfile, pathlib
+          d = tempfile.mkdtemp()
+          p = pathlib.Path(d, "test_probe.py")
+          p.write_text(
+              "import os\n"
+              "import pytest\n"
+              "\n"
+              "\n"
+              "class T:\n"
+              '    @pytest.mark.skipif(os.geteuid() == 0, reason="root")\n'
+              "    def test_x(self):\n"
+              "        pass\n",
+              encoding="utf-8",
+          )
+          recs = C.simulate_windows_imports([p])
+          print("RECORDS:", recs)
+          PY
