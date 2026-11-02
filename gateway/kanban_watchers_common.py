@@ -8,10 +8,8 @@ them from one place.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from contextvars import Context
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Keep the logger name run.py used so extracted log records are unchanged.
@@ -113,38 +111,38 @@ def _kanban_dispatch_allowed() -> bool:
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take the exclusive, non-blocking advisory lock for the sole dispatcher.
 
-    Only one gateway machine-wide may run the embedded dispatcher: concurrent
-    dispatchers double reclaim frequency and claim events, and with
-    ``wal_autocheckpoint=0`` concurrent manual checkpoints can corrupt index
-    pages. ``dispatch_in_gateway`` is the primary control; this is the backstop.
+    Only one dispatcher machine-wide may run: concurrent dispatchers double
+    reclaim frequency and claim events, and with ``wal_autocheckpoint=0``
+    concurrent manual checkpoints can corrupt index pages.
+    ``dispatch_in_gateway`` is the primary control; this is the backstop.
 
     Returns ``(handle, "held")`` (release via :func:`_release_singleton_lock`),
     ``(None, "contended")`` when another process holds it (caller must NOT
     dispatch), or ``(None, "unavailable")`` when locking cannot be performed
     (caller falls back to config control).
+
+    The primitive lives in ``hermes_cli.kanban_dispatch_lock`` because the
+    one-shot ``hermes kanban dispatch`` MUST contend with this same lock
+    (card ``t_716018cc``). Sharing one implementation — and one Windows
+    byte-range offset — is what makes the two sides actually exclude each
+    other; byte-range locks are per-offset, so two independent
+    implementations could lock different ranges of the same file and never
+    conflict.
     """
-    try:
-        from gateway.status import _try_acquire_file_lock  # deferred; same package
-    except ImportError:
-        return None, "unavailable"
-    try:
-        Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
-        handle = open(str(lock_path), "a+", encoding="utf-8")
-    except OSError:
-        return None, "unavailable"
-    if not _try_acquire_file_lock(handle):
-        handle.close()
+    from hermes_cli.kanban_dispatch_lock import acquire_dispatcher_lock
+
+    handle, state = acquire_dispatcher_lock(lock_path)
+    if state == "held":
+        return handle, "held"
+    if state == "contended":
         return None, "contended"
-    return handle, "held"
+    return None, "unavailable"
 
 
 def _release_singleton_lock(handle) -> None:
     """Release a lock acquired via :func:`_acquire_singleton_lock`."""
     if handle is None:
         return
-    with contextlib.suppress(Exception):
-        from gateway.status import _release_file_lock
+    from hermes_cli.kanban_dispatch_lock import release_dispatcher_lock
 
-        _release_file_lock(handle)
-    with contextlib.suppress(Exception):
-        handle.close()
+    release_dispatcher_lock(handle)

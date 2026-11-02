@@ -16,6 +16,12 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+from hermes_cli.kanban_dispatch_lock import (
+    acquire_dispatcher_lock as _acquire_dispatcher_lock,
+)
+from hermes_cli.kanban_dispatch_lock import (
+    release_dispatcher_lock as _release_dispatcher_lock,
+)
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
 
 
@@ -57,6 +63,54 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def _dispatch_skipped_for_lock(args: argparse.Namespace) -> int:
+    """Report that another dispatcher holds the machine-global lock.
+
+    Called when ``hermes kanban dispatch`` finds the machine-global
+    dispatcher lock already held — by the gateway, or by another CLI tick.
+
+    This is NOT a failure: the lock holder is dispatching, and this tick
+    simply did not happen. The exit code is 0 so the local watchdogs (which
+    run ``hermes kanban dispatch`` on a cron and log a non-zero rc as
+    "dispatch FAILED") do not report a healthy no-op as an error.
+
+    The JSON form carries ``dispatcher_lock_held: true`` so a caller that
+    needs to tell "another dispatcher is active" from "nothing to spawn"
+    can. That distinction is the whole point of the lock: a skipped tick and
+    an idle tick both spawn zero workers, but only one of them means
+    "somebody else is doing it".
+    """
+    if getattr(args, "json", False):
+        _print_json({
+            "dispatcher_lock_held": True,
+            "dispatcher_lock": "contended",
+            "skipped_locked": True,
+            "spawned": [],
+            "reclaimed": 0,
+            "promoted": 0,
+            "crashed": [],
+            "timed_out": [],
+            "stale": [],
+            "auto_blocked": [],
+            "skipped_unassigned": [],
+            "skipped_nonspawnable": [],
+            "skipped_per_profile_capped": [],
+            "auto_assigned_default": [],
+            "respawn_guarded": [],
+            "rate_limited": [],
+            "memory_pressure": None,
+            "max_in_progress_reached": None,
+            "max_spawn_reached": None,
+            "max_in_progress_per_profile_reached": None,
+        }, ascii=True)
+        return 0
+    print(
+        "Skipped: another dispatcher holds the machine-global dispatcher lock "
+        "(no workers spawned this tick — the lock holder is dispatching)"
+    )
+    return 0
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
@@ -81,16 +135,50 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    with kbc.connect_closing() as conn:
-        res = kbd.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-        )
+
+    # Machine-global singleton dispatcher lock (card t_716018cc).
+    #
+    # The per-board lock (kanban.db.dispatch.lock) serialises the WRITE tick,
+    # so two dispatchers never corrupt the WAL. It does NOT stop two
+    # dispatchers from SPAWNING workers at the same time — measured on the
+    # live gamedev board: 869 distinct CLI dispatcher processes issued 2342
+    # of 4996 claimed events (46.9 %), and 24 of 59 cron-watchdog spawns
+    # happened while the board was at max_in_progress=3.
+    #
+    # The gateway has taken the machine-global lock (kanban/.dispatcher.lock)
+    # since the single-dispatcher backstop was introduced. This one-shot CLI
+    # command did NOT, so it silently opted out of the very guard the repo
+    # already relies on. Taking the SAME lock here means: at most one
+    # dispatcher per machine, whatever started it.
+    #
+    # Non-blocking, and "skip" not "refuse": on a host with no gateway the
+    # lock is free and the CLI must still work.
+    #
+    # ``reentrant=True`` covers the one case where the CLI runs INSIDE the
+    # lock holder: the gateway serves `/kanban dispatch` as a slash command
+    # and holds this lock for its whole process lifetime. A plain attempt
+    # there would contend with the gateway's own lock and report a false
+    # "another dispatcher is active".
+    _lock_handle, _lock_state = _acquire_dispatcher_lock(reentrant=True)
+    if _lock_state == "contended":
+        return _dispatch_skipped_for_lock(args)
+    try:
+        with kbc.connect_closing() as conn:
+            res = kbd.dispatch_once(
+                conn,
+                dry_run=args.dry_run,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+            )
+    finally:
+        # Released before the CLI exits — the lock must never outlive the
+        # process, or the next dispatcher on this host would skip forever.
+        # A re-entrant ("already_held") acquire returns a None handle, and
+        # releasing None is a no-op: the process-level holder still owns it.
+        _release_dispatcher_lock(_lock_handle)
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
