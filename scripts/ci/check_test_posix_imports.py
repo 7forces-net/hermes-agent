@@ -255,69 +255,86 @@ import time  # noqa: E402
 import unittest  # noqa: E402
 import warnings  # noqa: E402
 
-# Drop them again: the stdlib above may have pulled them in.
+# Drop them again: the stdlib above may have pulled them in. The stdlib
+# keeps working (it holds direct references to the module objects), while a
+# fresh top-level import by the module under test now raises.
 for _name in list(sys.modules):
     if _name.split(".")[0] in BLOCKED_MODULES:
         del sys.modules[_name]
 
-# ── make the host LOOK like Windows ─────────────────────────────────────
+# ── make the host LOOK like Windows ─────────────────────────────────────────
 # The simulation has to fake the host, not just the module table. A module
-# that guards itself with ``sys.platform == "win32"`` or
-# ``os.name == "nt"`` takes its POSIX branch on a Linux runner, so the
-# POSIX-only reference it protects is evaluated and reported as a defect
-# that does not exist on a real Windows host (where the guard
-# short-circuits).
+# that guards itself with ``os.name == "nt"`` or ``sys.platform == "win32"``
+# takes its POSIX branch on a Linux runner, so the POSIX-only reference it
+# protects is evaluated and reported as a defect that does not exist on a
+# real Windows host (where the guard short-circuits).
 #
 # Faking the host is exactly what this repo's test policy warns about for
 # RUNTIME behaviour -- but here the fake is the POINT: the question is
-# "would this module import on Windows", and the honest way to answer it
-# is to make the interpreter's own view of the host match. The behaviour
-# under test (import-time evaluation) is not faked.
+# "would this module import on Windows", and the honest way to answer it is
+# to make the interpreter's own view of the host match. The behaviour under
+# test (import-time evaluation) is not faked.
 #
-# The fakes are installed AFTER the stdlib is preloaded, so the stdlib
-# keeps the classes and modules it bound at ITS import time (on a real
-# Windows host those bindings are the Windows ones). Only what is
-# resolved LATER -- the module under test reading ``sys.platform`` or
-# ``os.name`` -- sees the fake. That is exactly the surface the defect
-# lives on.
-_real_os_name = os.name
-_real_sys_platform = sys.platform
-os.name = "nt"
-sys.platform = "win32"
-
-# pathlib's Windows flavour refuses to be instantiated on a non-Windows
-# host ("cannot instantiate 'WindowsPath' on your system"), and
-# Path.__new__ picks WindowsPath because os.name is now "nt". We are
-# pretending to BE Windows, so that refusal is lifted -- on a real
-# Windows host WindowsPath is instantiable.
+# ``os.name`` is faked globally: nothing in the stdlib branches on it at
+# import time, and it is the check the tree uses to mean "Windows".
 #
-# The refusal lives on the pathlib FLAVOUR (a module-level singleton
-# whose ``is_supported`` flag pathlib checks), not on the class.
-try:
-    import pathlib as _pathlib
+# ``sys.platform`` is NOT faked globally. The stdlib DOES branch on it:
+# asyncio picks the Windows event loop policy, psutil picks its backend, and
+# on a POSIX host that means "cannot instantiate 'WindowsPath'" and
+# "name 'base_events' is not defined" errors that have nothing to do with the
+# module under test. Faking it broke the stdlib out from under the module,
+# so the module failed to import for the wrong reason and the guard reported
+# the wrong verdict. (Found by the guard's own regression tests on Linux.)
+#
+# ``os.name`` IS faked globally, but that has one consequence: ``pathlib``
+# resolves ``PurePath`` to ``PureWindowsPath`` when ``os.name == "nt"``, and
+# a PureWindowsPath cannot be instantiated on a POSIX host. So the Windows
+# path classes are bound explicitly, which is exactly what the stdlib would
+# have bound on a real Windows host.
+#
+# The POSIX-only MODULES are removed from ``sys.modules``, which is what
+# makes ``import termios`` fail the way it does on Windows.
+_REAL_OS_NAME = os.name
+_REAL_PURE_PATH = None
+if MODE == "simulate":
+    os.name = "nt"
 
-    _real_pure_path = _pathlib.PurePath
-    _pathlib.PurePath = _pathlib.PureWindowsPath
-    for _flavour in (
-        getattr(_pathlib, "_windows_flavour", None),
-        getattr(getattr(_pathlib, "WindowsPath", None), "_flavour", None),
-    ):
-        if _flavour is not None:
-            try:
-                _flavour.is_supported = True
-            except Exception:  # pragma: no cover - defensive
-                pass
-except Exception:  # pragma: no cover - defensive
-    _real_pure_path = None
-
-# Remove the os attributes Windows does not have. This is safe to do
-# globally: no stdlib module reaches for os.geteuid and friends at import
-# time, and it is exactly the shape of the defect being guarded.
-for _attr in WINDOWS_MISSING_OS_ATTRS:
     try:
-        delattr(os, _attr)
-    except AttributeError:
-        pass
+        import pathlib as _pathlib
+
+        # On a real Windows host pathlib binds the Windows flavours at import
+        # time. On a POSIX host it binds the POSIX ones, and ``PurePath`` --
+        # whose concrete class is chosen per instantiation, from the CURRENT
+        # os.name -- would resolve to PureWindowsPath, which REFUSES to be
+        # instantiated on a non-Windows host ("NotImplementedError: cannot
+        # instantiate 'WindowsPath' on your system"). We are pretending to
+        # BE Windows, so that refusal is lifted: on a real Windows host
+        # WindowsPath is instantiable.
+        #
+        # The refusal lives on the pathlib FLAVOUR (a module-level singleton
+        # whose ``is_supported`` flag pathlib checks), not on the class.
+        _REAL_PURE_PATH = _pathlib.PurePath
+        _pathlib.PurePath = _pathlib.PureWindowsPath
+        for _flavour in (
+            getattr(_pathlib, "_windows_flavour", None),
+            getattr(getattr(_pathlib, "WindowsPath", None), "_flavour", None),
+        ):
+            if _flavour is not None:
+                try:
+                    _flavour.is_supported = True
+                except Exception:  # pragma: no cover - defensive
+                    pass
+    except Exception:  # pragma: no cover - defensive
+        _REAL_PURE_PATH = None
+
+    # Remove the os attributes Windows does not have. This is safe to do
+    # globally: no stdlib module reaches for os.geteuid and friends at import
+    # time, and it is exactly the shape of the defect being guarded.
+    for _attr in WINDOWS_MISSING_OS_ATTRS:
+        try:
+            delattr(os, _attr)
+        except AttributeError:
+            pass
 
 results = []
 for _index, _rel in enumerate(MODULES):

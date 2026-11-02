@@ -19,7 +19,6 @@ collection, so the guard cannot pass by never firing.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -312,8 +311,8 @@ def test_fails_when_no_candidate_could_be_imported_at_all(tmp_path):
     what happens in a CI lane that installs no dependencies.
 
     The candidate here mentions a POSIX-only name (so the cheap pre-filter
-    selects it) but dies on a MISSING module that is not POSIX-only -- so it
-    is not a defect, it is a module the probe could not import at all.
+    selects it) but dies on a MISSING module that is not POSIX-only -- so
+    it is not a defect, it is a module the probe could not import at all.
     """
     _write(
         tmp_path,
