@@ -349,6 +349,22 @@ _SPECS = [
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
         _json_flag(),
     ], help="One dispatcher pass: reclaim stale, promote ready, spawn workers"),
+    _cmd("watchdog", [
+        _arg("--detect-only", action="store_true",
+             help="Report what the sweep would do and change nothing (read-only)"),
+        _arg("--no-probe", action="store_true",
+             help="Skip the provider health gate. The gate is what stops the sweep "
+                  "from acting inside a dead provider window; only for operators "
+                  "who deliberately disabled it in config.yaml"),
+        _arg("--allow-dispatch", action="store_true",
+             help="Opt in to spawning workers. OFF by default: a second dispatcher "
+                  "on a board the gateway already dispatches spawns orphans "
+                  "(see t_616ce70a). Even when enabled, the spawn goes through the "
+                  "machine-global singleton dispatcher lock"),
+        _arg("--max-dispatch", type=int,
+             help="Cap on workers spawned when --allow-dispatch is given"),
+        _json_flag(),
+    ], help="Board hygiene sweep: promote / reclaim / recover / detect (never dispatches by default)"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),

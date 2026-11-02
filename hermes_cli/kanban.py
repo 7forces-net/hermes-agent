@@ -217,7 +217,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
-    "gc",
+    "gc", "watchdog",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -1054,6 +1054,32 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_watchdog(args: argparse.Namespace) -> int:
+    """One board-hygiene sweep: promote / reclaim / recover / detect.
+
+    Never dispatches unless ``--allow-dispatch`` is passed (see
+    ``hermes_cli.kanban_watchdog`` for why a second dispatcher is harmful).
+    """
+    from hermes_cli import kanban_watchdog as kw
+
+    settings = kw.WatchdogSettings.from_config()
+    if getattr(args, "detect_only", False):
+        settings.detect_only = True
+    if getattr(args, "allow_dispatch", False):
+        settings.allow_dispatch = True
+    max_dispatch = getattr(args, "max_dispatch", None)
+    if max_dispatch is not None:
+        settings.max_dispatch = max(1, int(max_dispatch))
+
+    report = kw.run_watchdog(
+        board=kb.get_current_board(),
+        settings=settings,
+        probe=not getattr(args, "no_probe", False),
+    )
+    kw._print_report(report, as_json=bool(getattr(args, "json", False)))
+    return 0
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1266,6 +1292,7 @@ _HANDLERS = {
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "watchdog": _cmd_watchdog,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,

@@ -1803,6 +1803,42 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # `hermes kanban watchdog` — board hygiene sweep (promote / reclaim / recover / detect).
+        # Shipped as a repo command so the behaviour is not three opaque local scripts; see
+        # website/docs/user-guide/features/kanban-watchdog.md.
+        "watchdog": {
+            # Probe the provider chain BEFORE acting and leave the board untouched when no route
+            # answers. A worker that starts inside a dead provider window dies immediately and
+            # books a failure against work that was never attempted.
+            "require_provider_health": True,
+            # Report-only mode: the sweep says what it would do and changes nothing.
+            "detect_only": False,
+            # Spawn workers. OFF by default: a second dispatcher on a board the gateway already
+            # dispatches spawns orphans it can never reap (card t_616ce70a). When enabled, the
+            # spawn still goes through the machine-global singleton dispatcher lock.
+            "allow_dispatch": False,
+            # Cap on workers spawned per sweep when allow_dispatch is true.
+            "max_dispatch": 12,
+            # A `running` card whose worker PID is dead AND whose heartbeat is at least this old
+            # is a stale claim -> reclaimed.
+            "dead_worker_heartbeat_s": 60,
+            # A `running` card with no heartbeat for this long is reported as stuck (not
+            # reclaimed — the claim TTL owns reclamation).
+            "stuck_heartbeat_s": 1800,
+            # A `running` card older than this with no completion is reported as stuck.
+            "stuck_running_s": 3600,
+            # A `blocked` card older than this is reported for human attention. The watchdog
+            # never auto-unblocks a card a human parked; it only reports it.
+            "stuck_blocked_s": 1800,
+            # A `todo` card older than this whose parents are not all done is reported.
+            "stuck_todo_s": 3600,
+            # A QA card whose last N runs were ALL rejections is a reject loop -> reported.
+            "qa_reject_loop_runs": 8,
+            # A card reclaimed at least N times is thrashing -> reported.
+            "reclaim_thrash_runs": 5,
+            # Timeout for one provider health probe.
+            "probe_timeout_s": 45,
+        },
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
