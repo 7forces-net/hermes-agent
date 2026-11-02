@@ -4814,6 +4814,54 @@ def _respawn_storm_backoff() -> None:
         logger.debug("respawn-storm breaker check failed (non-fatal): %s", _be)
 
 
+def _start_gateway_claim_boot_slot(replace: bool = False) -> None:
+    """Claim this home's gateway boot slot BEFORE the heavy import graph runs.
+
+    Why this exists: the runtime lock and ``gateway.pid`` used to be claimed at
+    the very END of startup, after the import graph, the ``state.db`` migration
+    and the adapter connects. For the whole of that window the gateway had no
+    identity on disk, so every liveness probe — a supervisor's, a dashboard's, a
+    cron tick's — read "no gateway here" and concluded it had died. Each probe
+    then started another instance, and because none of them had claimed the
+    slot yet, they stacked: a single slow boot became a dozen concurrent
+    gateways on a host with no free memory.
+
+    Claiming first makes the boot VISIBLE: the slot is held from the first
+    moment of the process, so a second instance refuses immediately instead of
+    racing through the same minutes-long startup.
+
+    ``--replace`` is explicit startup authority: it means "take over from the
+    running instance", so the existing gateway is terminated FIRST and the slot
+    is then claimed. Without ``--replace``, a live gateway means we refuse —
+    the same contract ``_guard_existing_gateway_process_conflict`` states, but
+    enforced by the lock rather than by a preflight read.
+
+    Failure to claim is NOT fatal here: the authoritative claim still happens
+    later in ``gateway.run.start_gateway`` (``_start_gateway_claim_pid_file``),
+    so a boot that cannot claim early (an unreadable home, a transient lock
+    error) still proceeds and is protected by the later claim.
+    """
+    if replace:
+        # --replace: the running gateway is terminated by the later
+        # ``_start_gateway_replace_existing_instance`` path, which needs the
+        # import graph. Claiming the slot here would deadlock that path
+        # against our own lock, so leave the slot alone for now.
+        return
+    try:
+        from gateway.status import claim_gateway_boot_slot
+        if not claim_gateway_boot_slot():
+            # Someone else owns this home. The later claim would refuse too, but
+            # refusing HERE saves the minutes-long import + migration.
+            logger.error(
+                "Another gateway instance already owns this HERMES_HOME. "
+                "Exiting to avoid double-running.")
+            raise SystemExit(1)
+    except SystemExit:
+        raise
+    except Exception:
+        logger.debug("Early gateway boot-slot claim failed (non-fatal)", exc_info=True)
+
+
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
@@ -4823,6 +4871,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))
     _apply_startup_watchdog_config()
+    _start_gateway_claim_boot_slot(replace=replace)
 
     # Detached Windows runs (HERMES_GATEWAY_DETACHED=1, or non-TTY for older wrappers) ignore
     # console-control broadcasts from sibling CLIs; foreground runs keep Ctrl+C-to-stop.
@@ -6539,17 +6588,30 @@ def _cmd_migrate(args):
     cmd_migrate(args)
 
 
+def _cmd_gateway_watchdog(args):
+    """``hermes gateway watchdog`` — boot-aware gateway supervision."""
+    from hermes_cli.gateway_watchdog import _cmd_gateway_watchdog as _impl
+
+    return _impl(args)
+
+
 _GATEWAY_SUBCOMMANDS = {
     None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
     "uninstall": _cmd_uninstall, "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart,
     "status": _cmd_status, "list": _cmd_list, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
+    "watchdog": _cmd_gateway_watchdog,
 }
 
 
 def _gateway_command_inner(args):
     handler = _GATEWAY_SUBCOMMANDS.get(getattr(args, "gateway_command", None))
     if handler is not None:
-        handler(args)
+        result = handler(args)
+        # A handler that reports an unhealthy state (the watchdog's "no gateway"
+        # exit code 1) must reach the shell: a supervisor script checks the
+        # exit status, so swallowing it would make the command always look OK.
+        if isinstance(result, int) and result != 0:
+            raise SystemExit(result)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

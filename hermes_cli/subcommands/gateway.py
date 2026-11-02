@@ -7,6 +7,11 @@ from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
 
+# A gateway boot on a multi-GB state.db has been measured at ~13 minutes, so the
+# boot window the watchdog trusts is generous; past it a boot is presumed wedged
+# and a supervisor SHOULD take over rather than back off forever.
+DEFAULT_BOOT_WINDOW_S = 30 * 60
+
 
 # `start`/`restart` on a named profile refuse while the default multiplexer serves it (a second gateway
 # would double-bind its platforms); `gateway run` carries its own broader --force text.
@@ -114,6 +119,32 @@ def build_gateway_parser(
 
     gateway_uninstall = gateway_subparsers.add_parser("uninstall", help="Uninstall gateway service")
     _add_system_flag(gateway_uninstall)
+
+    # watchdog: supervision that can tell "still booting" from "dead". A
+    # gateway's boot can take minutes (import graph + a multi-GB state.db
+    # migration), and for that whole window it has no gateway.pid — so a
+    # supervisor that only checks the PID file starts a new instance every
+    # tick and they stack. See hermes_cli/gateway_watchdog.py.
+    gateway_watchdog = gateway_subparsers.add_parser(
+        "watchdog",
+        help="Report gateway liveness (boot-aware) and optionally ensure one is running",
+        description="Check whether this HERMES_HOME has a live gateway, a gateway that is "
+            "still booting, or neither. A booting gateway is reported as OK: starting a "
+            "second one is what causes the restart storm. 'ensure' only starts the gateway "
+            "when there is genuinely no live instance and no boot in progress, and only "
+            "with --start.")
+    gateway_watchdog.add_argument(
+        "watchdog_action", nargs="?", default="status", choices=["status", "ensure"],
+        help="status (default): report liveness. ensure: start the gateway if there is none.")
+    _flag(gateway_watchdog, "--start", dest="start",
+        help="Actually start the gateway when 'ensure' finds none (off by default)")
+    _flag(gateway_watchdog, "--dry-run", dest="dry_run",
+        help="With --start, report what would happen without launching anything")
+    gateway_watchdog.add_argument(
+        "--boot-window", dest="boot_window_s", type=int, default=DEFAULT_BOOT_WINDOW_S,
+        help="How long a boot marker is trusted before the boot is presumed wedged "
+            f"(default: {DEFAULT_BOOT_WINDOW_S}s)")
+    _flag(gateway_watchdog, "--json", dest="json", help="Emit JSON instead of text")
 
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 
