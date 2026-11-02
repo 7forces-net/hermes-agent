@@ -93,17 +93,26 @@ jobs:
         # permission tests on Linux. Run the module as root in a container
         # and confirm the skip reason is the ROOT one, not a Windows one.
         #
-        # The container installs the module's import-chain dependencies
-        # (pyyaml via hermes_cli.config, httpx for doctor_connectivity) --
-        # without them the module fails at COLLECTION for a reason that has
-        # nothing to do with the root skip, which would mask the real signal.
+        # The container needs the module's import-chain dependencies, and
+        # chasing them one at a time (yaml, then dotenv, then ...) is
+        # fragile. So the job's own venv -- already fully installed by
+        # `uv sync` -- is mounted into the container and reused: only the
+        # interpreter differs, and it runs as root.
+        #
+        # continue-on-error: a harness problem in THIS step must not hide the
+        # results of the other steps, which are the primary evidence.
+        continue-on-error: true
         run: |
           set -uo pipefail
           docker run --rm -v "$PWD:/w" -w /w \
+            -v "$PWD/.venv:/venv" \
+            -e "PATH=/venv/bin:$PATH" \
+            -e "VIRTUAL_ENV=/venv" \
             python:3.11-slim \
             sh -c '
-              pip install --no-cache-dir -q pytest pyyaml httpx psutil >/dev/null 2>&1
-              python -m pytest tests/hermes_cli/test_doctor_journal_modes.py -rA --tb=line 2>&1 | tail -50
+              /venv/bin/python -m pytest \
+                tests/hermes_cli/test_doctor_journal_modes.py \
+                -rA --tb=line 2>&1 | tail -60
             ' > /tmp/root-run.txt 2>&1 || true
           cat /tmp/root-run.txt
           echo "---- root-skip evidence ----"
@@ -116,6 +125,12 @@ jobs:
           # And it must NOT claim a Windows reason.
           if grep -qi "chmod is a no-op on Windows" /tmp/root-run.txt; then
             echo "::error::a Windows skip reason appeared on Linux"
+            exit 1
+          fi
+          # The root skip must be the ONLY reason: the module must still run
+          # its other tests, so the container is not simply erroring out.
+          if ! grep -qE "passed|skipped" /tmp/root-run.txt; then
+            echo "::error::the root container produced no test outcome at all"
             exit 1
           fi
 
