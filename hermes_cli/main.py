@@ -75,6 +75,25 @@ if _argv_is_gateway_run(sys.argv[1:]):
     except Exception:
         pass
 
+    # Boot-in-progress marker: published BEFORE the heavy import graph so a
+    # supervisor can tell "this gateway is still booting" from "this gateway is
+    # dead". Without it, the whole boot window looks like a dead gateway — the
+    # PID file is only claimed near the end of startup — and each supervision
+    # tick starts yet another instance. That is how one slow boot became a
+    # stack of twelve gateways on a machine with no free memory.
+    #
+    # ``gateway.status`` is imported lazily and defensively: it pulls in a
+    # handful of stdlib-only modules, but a failure here must never abort the
+    # boot. The marker is a hint, not authority — it never makes a process the
+    # gateway, it only tells a watcher that a boot is underway.
+    try:
+        from gateway.status import write_boot_marker as _write_boot_marker
+
+        _write_boot_marker()
+        del _write_boot_marker
+    except Exception:
+        pass
+
 
 def _exit_after_oneshot(rc: object) -> None:
     """Exit one-shot mode without letting late native finalizers change rc.
