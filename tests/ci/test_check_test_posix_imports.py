@@ -207,6 +207,83 @@ def test_does_not_fire_on_a_file_with_no_posix_reference(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_does_not_fire_on_an_os_name_guarded_reference(tmp_path):
+    """``os.name == "nt" or os.geteuid() == 0`` short-circuits on Windows.
+
+    The guard must not report the ``os.geteuid`` half, because on a real
+    Windows host the ``os.name`` check comes first and the geteuid is never
+    evaluated. This is the shape the tree actually uses
+    (``tests/hermes_cli/test_plugins_cmd.py``).
+    """
+    _write(
+        tmp_path,
+        "test_ok.py",
+        "import os\n"
+        "\n"
+        "import pytest\n"
+        "\n"
+        "\n"
+        '@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX mode bits")\n'
+        "def test_x():\n"
+        "    pass\n",
+    )
+
+    result = _run(str(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_does_not_fire_on_a_sys_platform_guarded_reference(tmp_path):
+    """``sys.platform == "win32" or os.geteuid() == 0`` also short-circuits."""
+    _write(
+        tmp_path,
+        "test_ok.py",
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "import pytest\n"
+        "\n"
+        "\n"
+        '@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="POSIX mode bits")\n'
+        "def test_x():\n"
+        "    pass\n",
+    )
+
+    result = _run(str(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_simulation_does_not_break_the_standard_library(tmp_path):
+    """The guard must judge the MODULE, not a broken stdlib.
+
+    Faking the host on a POSIX runner can make the standard library
+    unusable (``pathlib`` resolves to a WindowsPath that cannot be
+    instantiated there; ``asyncio`` picks the Windows event loop policy).
+    A module that then fails to import for THAT reason must not be reported
+    as a POSIX-import defect -- the verdict would be wrong.
+    """
+    _write(
+        tmp_path,
+        "test_uses_stdlib.py",
+        "import os\n"
+        "import pathlib\n"
+        "import subprocess\n"
+        "import threading\n"
+        "\n"
+        "\n"
+        "def test_x(tmp_path):\n"
+        "    assert isinstance(pathlib.PurePath('a'), pathlib.PurePath)\n"
+        "    assert subprocess.run(['echo', 'hi'], capture_output=True).returncode == 0\n",
+    )
+
+    result = _run(str(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    # And it must not be misreported as a POSIX problem either.
+    assert "cannot be imported on Windows" not in result.stderr
+
+
 # ── the pre-filter keeps it cheap ──────────────────────────────────────────
 
 

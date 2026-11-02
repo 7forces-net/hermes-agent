@@ -262,12 +262,43 @@ for _name in list(sys.modules):
 # to make the interpreter's own view of the host match. The behaviour under
 # test (import-time evaluation) is not faked.
 #
-# ``os.name`` and ``sys.platform`` are the two the tree keys on. Both are
-# plain module attributes, so they can be set for the duration of the probe.
+# ``os.name`` is faked globally: nothing in the stdlib branches on it at
+# import time, and it is the check the tree uses to mean "Windows".
+#
+# ``sys.platform`` is NOT faked globally. The stdlib DOES branch on it:
+# asyncio picks the Windows event loop policy, psutil picks its backend, and
+# on a POSIX host that means "cannot instantiate 'WindowsPath'" and
+# "name 'base_events' is not defined" errors that have nothing to do with the
+# module under test. Faking it broke the stdlib out from under the module,
+# so the module failed to import for the wrong reason and the guard reported
+# the wrong verdict. (Found by the guard's own regression tests on Linux.)
+#
+# ``os.name`` IS faked globally, but that has one consequence: ``pathlib``
+# resolves ``PurePath`` to ``PureWindowsPath`` when ``os.name == "nt"``, and
+# a PureWindowsPath cannot be instantiated on a POSIX host. So the Windows
+# path classes are bound explicitly, which is exactly what the stdlib would
+# have bound on a real Windows host.
+#
+# The POSIX-only MODULES are removed from ``sys.modules``, which is what
+# makes ``import termios`` fail the way it does on Windows.
 _REAL_OS_NAME = os.name
-_REAL_SYS_PLATFORM = sys.platform
 os.name = "nt"
-sys.platform = "win32"
+
+try:
+    import pathlib as _pathlib
+
+    # On a real Windows host pathlib binds the Windows flavours at import
+    # time. On a POSIX host it binds the POSIX ones, and ``PurePath`` -- whose
+    # concrete class is chosen per instantiation, from the CURRENT os.name --
+    # would resolve to PureWindowsPath and cannot be instantiated there.
+    # Bind it explicitly, which is what the stdlib would have bound on a
+    # real Windows host. (PureWindowsPath itself is pure: it can be
+    # instantiated on any host. The concrete ``Path`` was already bound when
+    # pathlib was imported, so it is left alone.)
+    _REAL_PURE_PATH = _pathlib.PurePath
+    _pathlib.PurePath = _pathlib.PureWindowsPath
+except Exception:  # pragma: no cover - defensive
+    _REAL_PURE_PATH = None
 
 # Remove the os attributes Windows does not have. This is safe to do
 # globally: no stdlib module reaches for os.geteuid and friends at import
@@ -338,7 +369,8 @@ with open(RESULTS_PATH, "w", encoding="utf-8") as _fh:
 # Restore the real host before exiting, so nothing downstream of this probe
 # in the same process sees a faked platform.
 os.name = _REAL_OS_NAME
-sys.platform = _REAL_SYS_PLATFORM
+if _REAL_PURE_PATH is not None:
+    _pathlib.PurePath = _REAL_PURE_PATH
 '''
 
 
