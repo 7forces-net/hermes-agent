@@ -308,10 +308,11 @@ def test_the_json_payload_distinguishes_locked_from_idle(
 
 
 def test_an_idle_tick_does_not_claim_the_lock(kanban_home, monkeypatch, capsys, clean_process_lock):
-    """The lock fields are PRESENT and false on a normal tick.
+    """The lock fields are PRESENT on a normal tick.
 
-    A caller must be able to rely on the field existing, not on it being
-    absent when the lock was free.
+    A consumer must be able to rely on the field existing, not on it being
+    absent when the lock was free — a payload whose keys come and go is a
+    payload every consumer has to guard against.
     """
     monkeypatch.setattr(
         kanban_ops.kbd,
@@ -321,7 +322,9 @@ def test_an_idle_tick_does_not_claim_the_lock(kanban_home, monkeypatch, capsys, 
     rc = kanban_ops._cmd_dispatch(_args(json=True))
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload.get("dispatcher_lock_held") is not True
+    assert "dispatcher_lock_held" in payload
+    assert payload["dispatcher_lock_held"] is False
+    assert payload["dispatcher_lock"] == "held"
     assert payload["spawned"] == []
 
 

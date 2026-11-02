@@ -200,6 +200,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
+            # Machine-global dispatcher lock. ALWAYS present, so a consumer
+            # can rely on the field existing rather than on it being absent
+            # when the lock was free. On a normal tick the CLI held the lock
+            # for the duration of the tick and released it before exiting;
+            # "held" means "this process was the dispatcher", not "the lock
+            # is still held now".
+            "dispatcher_lock_held": False,
+            "dispatcher_lock": "held",
             "memory_pressure": res.memory_pressure,
             "max_in_progress_reached": res.max_in_progress_reached,
             "max_spawn_reached": res.max_spawn_reached,
