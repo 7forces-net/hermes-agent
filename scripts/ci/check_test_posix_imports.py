@@ -29,18 +29,25 @@ offending file carries an OS marker, so the Windows lane never imported them.
 How this checker works
 ----------------------
 It does NOT try to reason about "is this reference evaluated at import time".
-Instead it asks Python, by running a subprocess in which the host is
-*simulated* to be Windows:
+Instead it asks Python, by importing the candidate module in a subprocess:
 
-  * a ``sys.meta_path`` finder raises ImportError for the POSIX-only stdlib
-    modules (``fcntl``, ``termios``, ``tty``, ``pwd``, ``grp``, ``resource``,
-    ``posix``, ``syslog``);
-  * the POSIX-only ``os`` attributes are deleted from the ``os`` module.
+``--native``     Import for real, on THIS host. On a real Windows runner this
+                 IS the answer -- there is no simulation to be wrong about.
 
-Importing a candidate module under that simulation reproduces EXACTLY what
-happens on a real Windows host. A module that survives it imports cleanly on
-Windows; a module that raises does not — and the collection error it causes
-is named in the report.
+(default)        Import under a SIMULATED Windows host, so the defect is also
+                 caught on a Linux runner:
+                   * a ``sys.meta_path`` finder raises ModuleNotFoundError for
+                     the POSIX-only stdlib modules (``fcntl``, ``termios``,
+                     ``tty``, ``pwd``, ``grp``, ``resource``, ``posix``,
+                     ``syslog``);
+                   * the POSIX-only ``os`` attributes are deleted from ``os``;
+                   * the host is faked (``os.name``, ``sys.platform``) so a
+                     module that guards itself with ``os.name == "nt"`` takes
+                     its Windows branch -- on a real Windows host that guard
+                     short-circuits, so the reference it protects is never
+                     evaluated.
+
+Both modes use the same classifier, so they agree on what counts as a defect.
 
 Cheapness
 ---------
@@ -52,10 +59,11 @@ one at import time.
 
 Usage:
     python scripts/ci/check_test_posix_imports.py --all
+    python scripts/ci/check_test_posix_imports.py --all --native
     python scripts/ci/check_test_posix_imports.py tests/tools/test_bot_turn_lock.py
 
 Exit status:
-    0 — every candidate test module imports cleanly under the Windows simulation
+    0 — every candidate test module imports cleanly on Windows
     1 — at least one candidate fails to import for a POSIX-only reason
 """
 
@@ -154,6 +162,10 @@ _CANDIDATE_RE = re.compile(
 
 #: The probe that runs in the subprocess. It installs the Windows simulation
 #: and imports each candidate module by file path.
+#:
+#: ``MODE`` is ``simulate`` (fake a Windows host -- used on a Linux runner)
+#: or ``native`` (import for real on THIS host -- used on a real Windows
+#: runner, where there is no simulation to be wrong about).
 _PROBE = r'''
 import importlib.util
 import json
@@ -166,6 +178,7 @@ WINDOWS_MISSING_OS_ATTRS = %(attrs)s
 REPO = sys.argv[1]
 MODULES = json.loads(sys.argv[2])
 RESULTS_PATH = sys.argv[3]
+MODE = sys.argv[4]
 
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
@@ -282,32 +295,46 @@ for _name in list(sys.modules):
 # The POSIX-only MODULES are removed from ``sys.modules``, which is what
 # makes ``import termios`` fail the way it does on Windows.
 _REAL_OS_NAME = os.name
-os.name = "nt"
+_REAL_PURE_PATH = None
+if MODE == "simulate":
+    os.name = "nt"
 
-try:
-    import pathlib as _pathlib
-
-    # On a real Windows host pathlib binds the Windows flavours at import
-    # time. On a POSIX host it binds the POSIX ones, and ``PurePath`` -- whose
-    # concrete class is chosen per instantiation, from the CURRENT os.name --
-    # would resolve to PureWindowsPath and cannot be instantiated there.
-    # Bind it explicitly, which is what the stdlib would have bound on a
-    # real Windows host. (PureWindowsPath itself is pure: it can be
-    # instantiated on any host. The concrete ``Path`` was already bound when
-    # pathlib was imported, so it is left alone.)
-    _REAL_PURE_PATH = _pathlib.PurePath
-    _pathlib.PurePath = _pathlib.PureWindowsPath
-except Exception:  # pragma: no cover - defensive
-    _REAL_PURE_PATH = None
-
-# Remove the os attributes Windows does not have. This is safe to do
-# globally: no stdlib module reaches for os.geteuid and friends at import
-# time, and it is exactly the shape of the defect being guarded.
-for _attr in WINDOWS_MISSING_OS_ATTRS:
     try:
-        delattr(os, _attr)
-    except AttributeError:
-        pass
+        import pathlib as _pathlib
+
+        # On a real Windows host pathlib binds the Windows flavours at import
+        # time. On a POSIX host it binds the POSIX ones, and ``PurePath`` --
+        # whose concrete class is chosen per instantiation, from the CURRENT
+        # os.name -- would resolve to PureWindowsPath, which REFUSES to be
+        # instantiated on a non-Windows host ("NotImplementedError: cannot
+        # instantiate 'WindowsPath' on your system"). We are pretending to
+        # BE Windows, so that refusal is lifted: on a real Windows host
+        # WindowsPath is instantiable.
+        #
+        # The refusal lives on the pathlib FLAVOUR (a module-level singleton
+        # whose ``is_supported`` flag pathlib checks), not on the class.
+        _REAL_PURE_PATH = _pathlib.PurePath
+        _pathlib.PurePath = _pathlib.PureWindowsPath
+        for _flavour in (
+            getattr(_pathlib, "_windows_flavour", None),
+            getattr(getattr(_pathlib, "WindowsPath", None), "_flavour", None),
+        ):
+            if _flavour is not None:
+                try:
+                    _flavour.is_supported = True
+                except Exception:  # pragma: no cover - defensive
+                    pass
+    except Exception:  # pragma: no cover - defensive
+        _REAL_PURE_PATH = None
+
+    # Remove the os attributes Windows does not have. This is safe to do
+    # globally: no stdlib module reaches for os.geteuid and friends at import
+    # time, and it is exactly the shape of the defect being guarded.
+    for _attr in WINDOWS_MISSING_OS_ATTRS:
+        try:
+            delattr(os, _attr)
+        except AttributeError:
+            pass
 
 results = []
 for _index, _rel in enumerate(MODULES):
@@ -316,7 +343,8 @@ for _index, _rel in enumerate(MODULES):
     _status = "ok"
     _detail = ""
     _simulator = _WindowsSimulator(BLOCKED_MODULES)
-    sys.meta_path.insert(0, _simulator)
+    if MODE == "simulate":
+        sys.meta_path.insert(0, _simulator)
     try:
         try:
             _spec = importlib.util.spec_from_file_location(_mod_name, _path)
@@ -354,10 +382,11 @@ for _index, _rel in enumerate(MODULES):
         # The block is scoped to the module under test. Without this the
         # POSIX-only modules stay unimportable for the rest of the probe,
         # which on a POSIX host breaks the stdlib for every later module.
-        try:
-            sys.meta_path.remove(_simulator)
-        except ValueError:
-            pass
+        if MODE == "simulate":
+            try:
+                sys.meta_path.remove(_simulator)
+            except ValueError:
+                pass
     results.append({"module": _rel, "status": _status, "detail": _detail})
 
 # Write to a FILE, not stdout: an imported test module may redirect stdout
@@ -398,12 +427,11 @@ def _relative(path: Path) -> str:
         return path.resolve().as_posix()
 
 
-def simulate_windows_imports(paths: list[Path]) -> list[dict]:
-    """Import each path under a simulated Windows host.
+def _run_probe(paths: list[Path], mode: str) -> list[dict]:
+    """Import each path in a subprocess and return one record per path.
 
-    Returns one record per path: ``{"module", "status", "detail"}`` where
-    ``status`` is ``ok``, ``skipped``, ``posix-module``, ``posix-os-attr``
-    or ``other-error``.
+    ``mode`` is ``simulate`` (fake a Windows host) or ``native`` (import for
+    real on this host).
     """
     relatives = [_relative(p) for p in paths]
     script = _PROBE % {
@@ -429,20 +457,41 @@ def simulate_windows_imports(paths: list[Path]) -> list[dict]:
                 str(REPO_ROOT),
                 json.dumps(relatives),
                 str(results_path),
+                mode,
             ],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=600,
+            timeout=1800,
         )
         if not results_path.exists():
             raise RuntimeError(
-                "the Windows-simulation probe produced no results "
+                "the import probe produced no results "
                 f"(exit {proc.returncode}):\n{proc.stderr[-4000:]}"
             )
         return json.loads(results_path.read_text(encoding="utf-8"))
+
+
+def simulate_windows_imports(paths: list[Path]) -> list[dict]:
+    """Import each path under a SIMULATED Windows host.
+
+    Returns one record per path: ``{"module", "status", "detail"}`` where
+    ``status`` is ``ok``, ``skipped``, ``posix-module``, ``posix-os-attr``
+    or ``other-error``.
+    """
+    return _run_probe(paths, "simulate")
+
+
+def native_imports(paths: list[Path]) -> list[dict]:
+    """Import each path for REAL, on this host.
+
+    On a real Windows host this IS the answer: no simulation, so nothing to
+    be wrong about. On a POSIX host it is the Linux truth, which is a
+    different question -- useful for cross-checking the simulation.
+    """
+    return _run_probe(paths, "native")
 
 
 def check_paths(paths: list[Path]) -> tuple[list[dict], list[dict]]:
@@ -489,6 +538,14 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Check the whole tests/ tree (the default when no path is given).",
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help=(
+            "Import for real on this host instead of simulating Windows. "
+            "Authoritative when run on a real Windows host."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.paths:
@@ -498,15 +555,17 @@ def main(argv: list[str]) -> int:
 
     files = _iter_python_files(roots)
     candidates = candidate_files(files)
+    mode = "native" if args.native else "simulate"
     print(
         f"scanned {len(files)} Python file(s); "
-        f"{len(candidates)} mention a POSIX-only name and are import-checked"
+        f"{len(candidates)} mention a POSIX-only name and are import-checked "
+        f"({mode})"
     )
     if not candidates:
         print("✓ no test module references a POSIX-only name — nothing to import-check")
         return 0
 
-    records = simulate_windows_imports(candidates)
+    records = native_imports(candidates) if args.native else simulate_windows_imports(candidates)
     defects = [r for r in records if r["status"].startswith("posix-")]
     others = [r for r in records if r["status"] == "other-error"]
 
