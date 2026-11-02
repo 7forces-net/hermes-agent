@@ -173,6 +173,26 @@ jobs:
             exit 1
           fi
           exit "$status"
+
+      # Every test module must be importable on THIS host.
+      #
+      # A module that cannot be imported is a pytest COLLECTION error, and a
+      # collection error INTERRUPTS the whole run: pytest exits 2 having
+      # collected and executed ZERO tests. So a full-suite run on Windows
+      # could look green while testing nothing.
+      #
+      # This lane runs the OS-marked tests, which narrows what pytest
+      # collects — so it would not catch an unmarked module that cannot be
+      # imported. This step imports EVERY candidate module on the real
+      # Windows host (no simulation), which is the authoritative check.
+      #
+      # The Linux lane runs the same check under a simulated Windows host
+      # (scripts/ci/check_test_posix_imports.py), so the defect is caught
+      # there too — but this lane is where the truth comes from.
+      - name: Every test module must import on this host
+        if: matrix.name == 'Windows-only tests'
+        shell: bash
+        run: uv run --no-sync python scripts/ci/check_test_posix_imports.py --all --native
         env:
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.

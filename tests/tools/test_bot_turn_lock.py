@@ -1,15 +1,19 @@
 """Tests: per-profile bot turn lock (#93091 — tools/bot_relay.py).
 
 Two deliveries into the same target profile must serialize on a
-cross-process flock; the queued one waits a bounded budget and then fails
-with a structured 'target_busy' refusal. Real flock on real (short)
-tmp_path lockfiles — flock contends between separate fds even within one
-process, so threads exercise the true kernel-lock semantics.
+cross-process lock; the queued one waits a bounded budget and then fails
+with a structured 'target_busy' refusal. Real OS lock on real (short)
+tmp_path lockfiles — the lock contends between separate handles even within
+one process, so threads exercise the true kernel-lock semantics.
+
+The lock is ``fcntl.flock`` on POSIX and a 1-byte ``msvcrt.locking`` range on
+Windows. Both are exercised here: the helper below takes whichever the HOST
+provides, so these tests verify the real lock on every platform rather than
+skipping away the one where the board's workers actually run.
 """
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -22,6 +26,24 @@ from tools import bot_mode_dm, bot_relay
 from tools.bot_relay import TurnBusyError, acquire_turn_lock, turn_lock_path
 
 
+def _lock_exclusive(handle) -> None:
+    """Take the exclusive lock on *handle* with the host's primitive.
+
+    Mirrors what ``tools.bot_relay`` does in production: ``fcntl.flock`` on
+    POSIX, ``msvcrt.locking`` on a 1-byte range on Windows. Both are released
+    by the kernel when the handle closes.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle, fcntl.LOCK_EX)
+
+
 @pytest.fixture
 def root(tmp_path):
     # Keep the lockfile path SHORT (macOS-safe).
@@ -31,13 +53,13 @@ def root(tmp_path):
 
 
 def _hold_flock(path, hold_event, release_event):
-    """Grab the profile lock on a separate fd, signal, hold until told."""
+    """Grab the profile lock on a separate handle, signal, hold until told."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    _lock_exclusive(fd)
     hold_event.set()
     release_event.wait(timeout=10)
-    os.close(fd)  # close releases the flock — process-death semantics
+    os.close(fd)  # close releases the lock — process-death semantics
 
 
 def test_second_delivery_waits_then_succeeds(root):
@@ -102,11 +124,11 @@ def test_different_profiles_do_not_contend(root):
 
 
 def test_lock_released_when_holder_fd_closes(root):
-    """flock dies with the holder's fd — a crashed turn can't wedge the profile."""
+    """The lock dies with the holder's handle — a crashed turn can't wedge the profile."""
     path = turn_lock_path(root, "ops")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    _lock_exclusive(fd)
     os.close(fd)  # simulate holder process death (kernel releases the lock)
     with acquire_turn_lock(root, "ops", timeout_seconds=0.5):
         pass  # acquires immediately — no TurnBusyError

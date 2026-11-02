@@ -158,7 +158,12 @@ jobs:
     # See scripts/check-windows-footguns.py for the full rule list.
     name: Windows footguns (blocking)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Raised from 5 to 15 minutes: this job now also installs the test
+    # dependencies and runs the Windows-import guard, which imports every
+    # candidate test module (~3 min on a warm runner, more on a cold one).
+    # The guard is the whole point of the lane — a timeout here would make
+    # it flaky rather than fast.
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -178,6 +183,31 @@ jobs:
 
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
+
+      # A test module that cannot be imported on Windows is a pytest
+      # COLLECTION error, and a collection error INTERRUPTS the whole run:
+      # pytest exits 2 having collected and executed ZERO tests. So a full
+      # suite run on Windows can look green while testing nothing.
+      #
+      # CI never caught it: the main tests lane is Linux-only, and the
+      # Windows lane narrows which FILES it imports (by OS marker) before
+      # selecting with -m — so an unmarked module with a POSIX-only
+      # import-time reference was never imported by either lane. This check
+      # imports every candidate under a simulated Windows host, so the
+      # defect is caught on the Linux runner.
+      #
+      # The check IMPORTS the candidate test modules, so it needs the
+      # project's dependencies (pytest above all). Without them every
+      # candidate dies on the import for a non-POSIX reason and the check
+      # would judge nothing — it now refuses to report success in that
+      # case, but the dependency install is what makes it meaningful.
+      - name: Install test dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Test modules must import on Windows
+        run: uv run --no-sync python scripts/ci/check_test_posix_imports.py --all
 
       # The Sep 2026 decomposition kept old import paths alive for external plugins
       # (PLUGIN-COMPAT blocks, see COMPAT_MANIFEST.md). They are removed on schedule by
