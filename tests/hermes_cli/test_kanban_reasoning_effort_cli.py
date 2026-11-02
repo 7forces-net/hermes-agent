@@ -277,6 +277,48 @@ class TestWorkerArgv:
         _reresolve_fallback_reasoning_config(agent)
         assert agent.reasoning_config != {"enabled": True, "effort": "xhigh"}
 
+    def test_a_model_switch_also_keeps_the_override(self):
+        """The same invariant on the ``/model`` swap path.
+
+        A ``/model`` switch re-resolves ``reasoning_config`` from config.yaml; an
+        explicit per-run override has to survive that too, or the card's level is
+        lost half-way through the run. The re-resolution is inlined in
+        ``switch_model()``, so this drives the real function with a stubbed agent
+        and asserts the resolved value.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = MagicMock()
+        agent.model = "old-model"
+        agent.provider = "old-provider"
+        agent.requested_provider = "old-provider"
+        agent.base_url = ""
+        agent.api_mode = "chat_completions"
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent._reasoning_effort_override = {"enabled": True, "effort": "xhigh"}
+        agent.context_compressor = None
+        agent._custom_providers = []
+        agent._primary_runtime = {}
+        agent._cached_system_prompt = "sp"
+        agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
+
+        with (
+            patch("agent.agent_runtime_helpers._resolve_switch_destination",
+                  return_value=("chat_completions", "", {})),
+            patch("agent.agent_runtime_helpers._snapshot_switch_state", return_value={}),
+            patch("agent.agent_runtime_helpers._swap_switch_runtime"),
+            patch("agent.agent_runtime_helpers._resolve_switch_context_length",
+                  return_value=(None, 0)),
+            patch("agent.agent_runtime_helpers._finish_switch"),
+        ):
+            switch_model(agent, "new-model", "new-provider")
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}, (
+            "an explicit per-run override must survive a model switch"
+        )
+
 
 # ---------------------------------------------------------------------------
 # The vocabulary is not widened
