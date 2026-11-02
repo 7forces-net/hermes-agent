@@ -92,7 +92,10 @@ def test_report_gateway_start_failure_is_loud_not_checkmark(monkeypatch, tmp_pat
     out = capsys.readouterr().out
     assert "✓" not in out
     assert "FAILED" in out
-    assert "schtasks /Run /TN Hermes_Gateway_x" in out
+    # The recovery hint must name the task the way schtasks addresses it: the
+    # folder-qualified "\Hermes\Hermes_Gateway_x", not the bare leaf (a bare leaf
+    # addresses a ROOT-level task, which is a different one).
+    assert "schtasks /Run /TN \\Hermes\\Hermes_Gateway_x" in out
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +162,7 @@ def test_attestation_warning_includes_schtasks_recovery(monkeypatch, attest_home
     )
     gateway_windows._write_start_attestation([888], "direct spawn (PID 888)")
     warning = gateway_windows.check_start_attestation(current_pids=[])
-    assert "schtasks /Run /TN Hermes_Gateway_arthur_tutor" in warning
+    assert "schtasks /Run /TN \\Hermes\\Hermes_Gateway_arthur_tutor" in warning
 
 
 def test_attestation_tolerates_missing_and_garbage_marker(attest_home):
@@ -188,7 +191,7 @@ def test_breakaway_fallback_warns_even_on_success(monkeypatch, attest_home, caps
     out = capsys.readouterr().out
     assert "✓" in out
     assert "could not break away" in out
-    assert "schtasks /Run /TN Hermes_Gateway" in out
+    assert "schtasks /Run /TN \\Hermes\\Hermes_Gateway" in out
 
 
 # ---------------------------------------------------------------------------

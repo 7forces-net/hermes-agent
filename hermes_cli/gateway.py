@@ -1682,11 +1682,13 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     # (#86098, #87001).
     if is_windows():
         try:
-            from hermes_cli.gateway_windows import get_task_name  # profile-aware task name
+            from hermes_cli.gateway_windows import get_task_name, get_task_path  # profile-aware task name
             _task_name = get_task_name()
+            _task_path = get_task_path()
         except Exception:
             _task_name = "Hermes_Gateway"
-        if _windows_scheduled_task_supervises(_task_name):
+            _task_path = None
+        if _windows_scheduled_task_supervises(_task_name, _task_path):
             return False
 
     from gateway.status import _pid_exists, get_process_start_time, write_planned_stop_marker
@@ -1929,28 +1931,51 @@ def _gw_windows():
 _WINDOWS_TASK_SUPERVISOR_STATES = frozenset({"Running", "Ready", "Queued"})
 
 
-def _windows_scheduled_task_state(task_name: str) -> str | None:
-    """English ``Get-ScheduledTask`` State, or None on failure. PowerShell, not ``schtasks``: schtasks
-    localizes its output in the local codepage (utf-8 decoding mangles it); the State enum is stable."""
+def _windows_scheduled_task_states(task_name: str, task_path: str | None = None) -> list[str]:
+    """Every ``Get-ScheduledTask`` State for this task, or ``[]`` on failure. PowerShell, not
+    ``schtasks``: schtasks localizes its output in the local codepage (utf-8 decoding mangles it);
+    the State enum is stable.
+
+    ``task_path`` is the Task Scheduler FOLDER (e.g. ``\\Hermes\\``). Without it the lookup is
+    ambiguous: an unqualified ``-TaskName`` matches a task of that leaf name in EVERY folder,
+    and PowerShell then returns one State per match (measured: two tasks with the same leaf
+    name -> "Ready\\nReady"). The folder is therefore required for an unambiguous answer.
+    """
     if not is_windows():
-        return None
-    ps_cmd = f"$t = Get-ScheduledTask -TaskName '{task_name}' -ErrorAction SilentlyContinue; if ($t) {{ $t.State }} else {{ 'MISSING' }}"
+        return []
+    path_clause = f"-TaskPath '{task_path}' " if task_path else ""
+    ps_cmd = (
+        f"$t = Get-ScheduledTask {path_clause}-TaskName '{task_name}' -ErrorAction SilentlyContinue; "
+        "if ($t) { $t.State } else { 'MISSING' }"
+    )
     try:
         powershell = shutil.which("powershell") or shutil.which("pwsh")
         if powershell is None:
-            return None
+            return []
         result = subprocess.run(
             [powershell, "-NoProfile", "-Command", ps_cmd],
             capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=10,
         )
         if result.returncode != 0:
-            return None
-        return (result.stdout or "").strip() or None
+            return []
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return []
 
 
-def _windows_scheduled_task_supervises(task_name: str) -> bool:
+def _windows_scheduled_task_state(task_name: str, task_path: str | None = None) -> str | None:
+    """The single State of this task, or None when it cannot be determined.
+
+    None for an AMBIGUOUS answer (more than one task matched): a caller cannot act on
+    "Ready\\nReady" as one state.
+    """
+    states = _windows_scheduled_task_states(task_name, task_path)
+    if len(states) == 1:
+        return states[0]
+    return None
+
+
+def _windows_scheduled_task_supervises(task_name: str, task_path: str | None = None) -> bool:
     """True when Task Scheduler still owns this profile's gateway (Ready counts: the task is Ready, not
     Running, after bootstrap exits). Any failure returns False so callers fall back to pidfile / parent-chain.
 
@@ -1959,8 +1984,12 @@ def _windows_scheduled_task_supervises(task_name: str) -> bool:
     not Running; a Running-only check still writes the planned-stop marker, the gateway exits cleanly with
     code 0, and the scheduler never restarts it — silently killing A2A/messaging on every desktop-app launch
     (#86098, #87001).
+
+    An ambiguous lookup (several tasks of that leaf name) counts as supervised when ANY of
+    them is: this guard exists to AVOID killing a live gateway, so it must fail safe.
     """
-    return _windows_scheduled_task_state(task_name) in _WINDOWS_TASK_SUPERVISOR_STATES
+    states = _windows_scheduled_task_states(task_name, task_path)
+    return any(state in _WINDOWS_TASK_SUPERVISOR_STATES for state in states)
 
 
 def _gateway_detached_env() -> bool:

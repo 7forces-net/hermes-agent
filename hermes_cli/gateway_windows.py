@@ -47,6 +47,10 @@ _ACCESS_DENIED_PATTERN = re.compile(r"(access is denied|acceso denegado)", re.IG
 _LAST_SPAWN_BREAKAWAY_FALLBACK: dict = {"fallback": False}
 
 _TASK_NAME_DEFAULT = "Hermes_Gateway"
+# Task Scheduler FOLDER for Hermes' tasks. A task in a folder is addressed as
+# "\Hermes\Hermes_Gateway"; the bare leaf addresses a task in the ROOT folder, which is a
+# DIFFERENT task (measured: schtasks /Query finds neither under the other's name).
+_TASK_FOLDER = "\\Hermes\\"
 _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
 _TASK_RESTART_INTERVAL = "PT1M"
@@ -217,12 +221,55 @@ def _launch_elevated_install(force: bool = False, *, start_now: bool | None = No
 # ── Paths: where we stash our task script and where Startup lives
 
 def get_task_name() -> str:
-    """Scheduled Task name, scoped per profile."""
+    """Scheduled Task LEAF name, scoped per profile.
+
+    This is also the launcher's FILE name (``<task name>.cmd`` / ``.vbs``), so it stays
+    a bare leaf. Use ``get_task_schtasks_name()`` for anything passed to ``schtasks``.
+    """
     _assert_windows()
     from hermes_cli.gateway import _profile_suffix  # local: avoids circular init during boot
 
     suffix = _profile_suffix()
     return f"{_TASK_NAME_DEFAULT}_{suffix}" if suffix else _TASK_NAME_DEFAULT
+
+
+def get_task_path() -> str:
+    """Task Scheduler FOLDER that holds Hermes' tasks, e.g. ``\\Hermes\\``.
+
+    A task registered in a folder is addressed as ``\\Hermes\\Hermes_Gateway``; the bare
+    leaf ``Hermes_Gateway`` addresses a task in the ROOT folder, which is a DIFFERENT
+    task. Measured: ``schtasks /Query /TN Hermes_Gateway`` returns "cannot find the file"
+    for a task registered at ``\\Hermes\\Hermes_Gateway`` and vice versa — so every
+    schtasks argv must be folder-qualified or it silently addresses nothing.
+    """
+    return _TASK_FOLDER
+
+
+def get_task_schtasks_name() -> str:
+    """The folder-qualified task name for ``schtasks /TN`` (e.g. ``\\Hermes\\Hermes_Gateway``)."""
+    return f"{get_task_path()}{get_task_name()}"
+
+
+def registered_task_name() -> str:
+    """The task name that actually addresses this profile's task.
+
+    Two spellings can exist: the folder-qualified ``\\Hermes\\Hermes_Gateway`` (the
+    authoritative one) and a root-level ``Hermes_Gateway`` that older Hermes builds
+    registered. They are DIFFERENT tasks — ``schtasks /Query /TN`` under one name does not
+    find the other (measured) — and the root-level one launches the SAME gateway, so it is
+    a second messaging poller on one token and a second writer on one kanban.db.
+
+    Returns whichever spelling is registered, preferring the folder-qualified one.
+    """
+    qualified = get_task_schtasks_name()
+    code, _out, _err = _exec_schtasks(["/Query", "/TN", qualified])
+    if code == 0:
+        return qualified
+    leaf = get_task_name()
+    code, _out, _err = _exec_schtasks(["/Query", "/TN", leaf])
+    if code == 0:
+        return leaf
+    return qualified
 
 
 def _sanitize_filename(value: str) -> str:
@@ -412,23 +459,59 @@ def _atomic_write(path: Path, content: str, tmp: Path) -> None:
 # ── Install / uninstall
 
 def _resolve_task_user() -> str | None:
-    """Return ``DOMAIN\\USER`` if available, else bare USERNAME, else None."""
+    """Return ``DOMAIN\\USER`` if available, else bare USERNAME, else the account SID.
+
+    The SID fallback matters because the value is written into the task's logon trigger:
+    a trigger WITHOUT a ``<UserId>`` means "at every user's logon", which only an
+    administrator may register (measured: ``schtasks /Create /XML`` -> "Access is
+    denied." for the unelevated account). A name-less trigger must never be emitted.
+    """
     username = os.environ.get("USERNAME") or os.environ.get("USER") or os.environ.get("LOGNAME")
-    if not username:
+    if username:
+        if "\\" in username:
+            return username
+        domain = os.environ.get("USERDOMAIN")
+        return f"{domain}\\{username}" if domain else username
+    return _resolve_current_user_sid()
+
+
+def _resolve_current_user_sid() -> str | None:
+    """The current user's SID (``S-1-5-21-...-1001``), or None when it cannot be read.
+
+    Task Scheduler accepts a SID wherever it accepts an account name, and the SID is the
+    one spelling that does not depend on the account's domain/rename.
+    """
+    try:
+        proc = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, encoding=_schtasks_encoding(), errors="replace",
+            timeout=_SCHTASKS_TIMEOUT_S, creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    if "\\" in username:
-        return username
-    domain = os.environ.get("USERDOMAIN")
-    return f"{domain}\\{username}" if domain else username
+    if proc.returncode != 0:
+        return None
+    for raw in (proc.stdout or "").splitlines():
+        for field in (part.strip() for part in raw.split(",")):
+            if re.fullmatch(r"S-1-\d+(?:-\d+)+", field):
+                return field
+    return None
 
 
 def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | None) -> str:
     """Task Scheduler XML with safe long-running defaults. ``launcher_path`` is the console-less
     ``.vbs`` run via ``wscript.exe`` (see ``_build_gateway_vbs_script`` for why not cmd.exe).
 
+    The logon trigger MUST name the user (``<LogonTrigger><UserId>``). A logon trigger with no
+    ``<UserId>`` means "run at every user's logon", which only an administrator may register:
+    the unelevated account gets ``schtasks /Create /XML`` -> "ERROR: Access is denied." The
+    ``<Principal>``'s ``<UserId>`` does NOT scope the trigger — measured A/B, one element
+    changed: bare trigger denied, trigger + ``<UserId>`` accepted (see #45599).
+
     See #45599.
     """
     user_principal = f"\n      <UserId>{escape(user)}</UserId>" if user else ""
+    trigger_user = f"\n      <UserId>{escape(user)}</UserId>" if user else ""
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -437,7 +520,7 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
-      <Delay>{_TASK_LOGON_DELAY}</Delay>
+      <Delay>{_TASK_LOGON_DELAY}</Delay>{trigger_user}
     </LogonTrigger>
   </Triggers>
   <Principals>
@@ -480,37 +563,90 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
 
 
 def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, str]:
-    """Create or replace the Scheduled Task. Returns (success, detail). Always delete+create, never
-    ``/Change``: it preserves stale repeat/restart settings that relaunch the gateway every minute."""
-    delete_code, delete_out, delete_err = _exec_schtasks(["/Delete", "/F", "/TN", task_name])
-    delete_detail = (delete_err or delete_out or "").strip()
-    if "cannot find" in delete_detail.lower():
-        delete_detail = ""
-    if delete_code != 0 and delete_detail and _is_access_denied(delete_detail):
-        return (False, f"schtasks /Delete failed (code {delete_code}): {delete_detail}")
-    # Other /Delete failures are non-fatal: /Create /F may still replace it; keep the detail.
+    """Create or replace the Scheduled Task. Returns (success, detail).
+
+    CREATE-first, never delete-first. ``schtasks /Create /F`` replaces an existing task's
+    definition outright — measured: a minute-repeat task replaced by this XML becomes
+    "At logon time" with "Repeat: Every: N/A" — so the delete bought nothing and opened a
+    data-loss window: on a host where ``/Create`` is denied but ``/Delete`` is not, a
+    FAILED install destroyed the working supervisor and then reported the failure. The
+    delete is now only the fallback for a task that refuses to be replaced in place.
+
+    Never ``/Change``: it preserves stale repeat/restart settings that relaunch the gateway
+    every minute.
+    """
     user = _resolve_task_user()
     launcher_path = script_path.with_suffix(".vbs")   # the task launches the console-less .vbs
     xml_path = launcher_path.with_suffix(".task.xml")
     xml_path.write_text(_build_scheduled_task_xml(task_name, launcher_path, user), encoding="utf-16", newline="")
     # Immediate manual starts use _spawn_detached(). See #45599.
     base = ["/Create", "/F", "/TN", task_name, "/XML", str(xml_path)]
-    variants = [[*base, "/RU", user, "/NP", "/IT"], base] if user else [base]
+    # No "/RU <user> /NP /IT" variant: it makes schtasks PROMPT for a password and then fail
+    # with "Access is denied." (measured). The prompt is swallowed by capture_output, so the
+    # attempt is a silent 15 s hang that can never succeed. The user is already named in the
+    # definition itself — in the principal AND in the logon trigger.
     last_code, last_err = 1, ""
     try:
-        for argv in variants:
-            code, out, err = _exec_schtasks(argv)
-            if code == 0:
-                return (True, f"Created Scheduled Task {task_name!r}")
-            last_code, last_err = code, (err or out or "")
+        code, out, err = _exec_schtasks(base)
+        if code == 0:
+            _remove_legacy_root_task(task_name)
+            return (True, f"Created Scheduled Task {task_name!r}")
+        last_code, last_err = code, (err or out or "")
     finally:
         try:
             xml_path.unlink(missing_ok=True)
         except OSError:
             pass
+    # The definition was refused in place. A PERMISSION failure must never reach the
+    # delete: on this host /Delete succeeds where /Create is denied, so deleting here would
+    # destroy a working supervisor because of a permission error — the exact data-loss
+    # path this function used to have. Only a non-permission failure (a genuinely corrupt
+    # task) may delete, and then only as a fallback.
+    if _is_access_denied(last_err):
+        return (False, f"schtasks /Create failed (code {last_code}): {last_err.strip()}")
+    delete_code, delete_out, delete_err = _exec_schtasks(["/Delete", "/F", "/TN", task_name])
+    delete_detail = (delete_err or delete_out or "").strip()
+    if "cannot find" in delete_detail.lower():
+        delete_detail = ""
+    if delete_code == 0:
+        try:
+            xml_path.write_text(
+                _build_scheduled_task_xml(task_name, launcher_path, user), encoding="utf-16", newline=""
+            )
+            code, out, err = _exec_schtasks(base)
+            if code == 0:
+                _remove_legacy_root_task(task_name)
+                return (True, f"Created Scheduled Task {task_name!r}")
+            last_code, last_err = code, (err or out or "")
+        finally:
+            try:
+                xml_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    elif delete_detail and _is_access_denied(delete_detail):
+        return (False, f"schtasks /Delete failed (code {delete_code}): {delete_detail}")
     if delete_detail:
         last_err = f"{last_err.strip()} (delete detail: {delete_detail})"
     return (False, f"schtasks /Create failed (code {last_code}): {last_err.strip()}")
+
+
+def _remove_legacy_root_task(task_name: str) -> None:
+    """Delete a ROOT-level task of the same leaf name, if one exists.
+
+    Older Hermes builds registered the task without a folder, so a host can end up with
+    both ``\\Hermes\\Hermes_Gateway`` and a root-level ``Hermes_Gateway``. The root-level
+    one launches the SAME gateway — a second messaging poller on one token and a second
+    writer on one kanban.db. Best-effort: a failure here must not fail the install.
+    """
+    leaf = task_name.rsplit("\\", 1)[-1]
+    if not leaf or leaf == task_name:
+        return   # already a bare leaf, or the folder-qualified name: nothing legacy to remove
+    code, _out, _err = _exec_schtasks(["/Query", "/TN", leaf])
+    if code != 0:
+        return   # no root-level task of that name: nothing to remove
+    code, _out, _err = _exec_schtasks(["/Delete", "/F", "/TN", leaf])
+    if code == 0:
+        print(f"✓ Removed legacy root-level Scheduled Task {leaf!r} (duplicate launcher for the same gateway)")
 
 
 def _install_startup_entry(script_path: Path) -> Path:
@@ -786,20 +922,13 @@ def install(
             print("  Run later with: hermes gateway start")
         return
 
-    task_name = get_task_name()
+    task_name = get_task_schtasks_name()
     script_path = _write_task_script()
 
-    # On locked-down accounts schtasks can sit for the full timeout before returning Access Denied.
-    # All intent questions were asked above, so ask for UAC before touching schtasks.
-    if not _is_running_as_admin() and not elevated_handoff:
-        if _offer_elevated_install(
-            "↻ Scheduled Task install may need administrator approval on this Windows account.",
-            force, start_now, start_on_login,
-        ):
-            return
-        _install_startup_fallback(script_path, start_now, "administrator approval was not used")
-        return
-
+    # The definition names the user (logon trigger + principal), so an UNELEVATED standard
+    # account can register it: measured, "schtasks /Create /XML" with a bare <LogonTrigger>
+    # is "Access is denied." for the unelevated account, and with a trigger <UserId> it
+    # succeeds. Try that first — a UAC prompt is a worse answer than a working install.
     ok, detail = _install_scheduled_task(task_name, script_path)
     if ok:
         print(f"✓ {detail}")
@@ -813,8 +942,8 @@ def install(
         _print_next_steps()
         return
 
-    # Prefer a real Scheduled Task over the Startup fallback when elevation is the only blocker.
-    if _is_access_denied(detail) and not _is_running_as_admin() and _offer_elevated_install(
+    # The unelevated install failed. Only now is elevation worth asking for.
+    if not _is_running_as_admin() and not elevated_handoff and _offer_elevated_install(
         f"↻ Scheduled Task install needs administrator approval ({detail.splitlines()[0]})",
         force, start_now, start_on_login,
     ):
@@ -1099,7 +1228,8 @@ def _task_run_hint(fmt: str) -> str | None:
     """``fmt`` with the task name filled in, when a Scheduled Task is registered. Never raises."""
     try:
         if is_task_registered():
-            return fmt.format(get_task_name())
+            # The name that actually addresses the task: "/Run /TN" needs the folder.
+            return fmt.format(registered_task_name())
     except Exception:
         pass
     return None
@@ -1144,7 +1274,7 @@ def _print_next_steps() -> None:
 def uninstall() -> None:
     """Remove both the Scheduled Task and the Startup-folder fallback, if present."""
     _assert_windows()
-    task_name = get_task_name()
+    task_name = get_task_schtasks_name()
     script_path = get_task_script_path()
 
     scheduled_task_removed = False
@@ -1170,6 +1300,17 @@ def uninstall() -> None:
         else:
             print(f"⚠ schtasks /Delete returned code {code}: {detail}")
 
+    # A root-level task of the same leaf name is the SAME gateway's second launcher —
+    # remove it too, or it keeps starting a duplicate poller.
+    leaf = get_task_name()
+    code, _out, _err = _exec_schtasks(["/Query", "/TN", leaf])
+    if code == 0:
+        del_code, _del_out, del_err = _exec_schtasks(["/Delete", "/F", "/TN", leaf])
+        if del_code == 0:
+            print(f"✓ Removed legacy root-level Scheduled Task {leaf!r}")
+        else:
+            print(f"⚠ schtasks /Delete returned code {del_code}: {del_err.strip()}")
+
     for path, label in (
         (get_startup_entry_path(), "Windows login item"), (_legacy_startup_entry_path(), "legacy Windows login item"),
         (script_path, "Task script"), (script_path.with_suffix(".vbs"), "Task launcher"),
@@ -1187,8 +1328,18 @@ def uninstall() -> None:
 # ── Status / start / stop / restart
 
 def is_task_registered() -> bool:
-    code, _out, _err = _exec_schtasks(["/Query", "/TN", get_task_name()])
-    return code == 0
+    """True when the Scheduled Task exists.
+
+    Both spellings are checked: the folder-qualified ``\\Hermes\\Hermes_Gateway`` (the
+    authoritative one) and the root-level ``Hermes_Gateway`` that older builds registered.
+    The root-level one is a duplicate launcher for the same gateway, so it counts as
+    "installed" until install or uninstall removes it.
+    """
+    for name in (get_task_schtasks_name(), get_task_name()):
+        code, _out, _err = _exec_schtasks(["/Query", "/TN", name])
+        if code == 0:
+            return True
+    return False
 
 
 def is_startup_entry_installed() -> bool:
@@ -1202,7 +1353,10 @@ def is_installed() -> bool:
 
 def query_task_status() -> dict[str, str]:
     """Parse ``schtasks /Query /V /FO LIST`` and pull the interesting keys."""
-    code, out, err = _exec_schtasks(["/Query", "/TN", get_task_name(), "/V", "/FO", "LIST"])
+    code, out, err = _exec_schtasks(["/Query", "/TN", get_task_schtasks_name(), "/V", "/FO", "LIST"])
+    if code != 0:
+        # Fall back to the root-level task of the same leaf name (older builds registered it there).
+        code, out, err = _exec_schtasks(["/Query", "/TN", get_task_name(), "/V", "/FO", "LIST"])
     if code != 0:
         return {}
     info: dict[str, str] = {}
@@ -1348,7 +1502,7 @@ def status(deep: bool = False) -> None:
     """Print a status report for the Windows gateway service."""
     _assert_windows()
     _print_start_attestation_warning()   # once: a gateway that died after a previous ✓
-    task_name = get_task_name()
+    task_name = registered_task_name()
     task_installed = is_task_registered()
     startup_installed = is_startup_entry_installed()
     pids = _gateway_pids()
@@ -1498,7 +1652,7 @@ def stop() -> None:
 
     stopped_any = drained
     if is_task_registered():
-        code, _out, err = _exec_schtasks(["/End", "/TN", get_task_name()])
+        code, _out, err = _exec_schtasks(["/End", "/TN", get_task_schtasks_name()])
         # schtasks returns nonzero when the task isn't currently running — not an error.
         if code == 0:
             stopped_any = True

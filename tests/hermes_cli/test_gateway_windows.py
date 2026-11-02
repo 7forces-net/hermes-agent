@@ -267,7 +267,7 @@ def test_elevated_gateway_command_uses_hidden_console_python(monkeypatch):
 
 
 def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_path):
-    """Install must delete+create so stale minute-repeat task settings are not preserved.
+    """Install must CREATE (not ``/Change``) so stale minute-repeat task settings are not preserved.
 
     Host-agnostic on purpose: ``_install_scheduled_task`` only renders the task
     XML and shells out through ``_exec_schtasks`` (mocked here as the genuine
@@ -287,6 +287,8 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
             xml_path = Path(args[args.index("/XML") + 1])
             xml_seen["text"] = xml_path.read_text(encoding="utf-16")
             return (0, "SUCCESS", "")
+        if args[0] == "/Query":
+            return (1, "", "ERROR: The system cannot find the file specified.")
         raise AssertionError(f"unexpected schtasks args: {args}")
 
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
@@ -294,10 +296,12 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
 
     assert ok is True
     assert "/Change" not in [arg for call in calls for arg in call]
-    assert calls[0][:4] == ("/Delete", "/F", "/TN", "Hermes_Gateway_alice")
-    assert calls[1][0] == "/Create"
-    assert "/XML" in calls[1]
-    assert "/SC" not in calls[1]
+    # CREATE first: "/Create /F" replaces the definition in place, so a delete-first
+    # install would destroy a working supervisor whenever the create then failed.
+    assert calls[0][0] == "/Create"
+    assert calls[0][:4] == ("/Create", "/F", "/TN", "Hermes_Gateway_alice")
+    assert "/XML" in calls[0]
+    assert "/SC" not in calls[0]
     assert "<Delay>PT30S</Delay>" in xml_seen["text"]
     assert "<StartWhenAvailable>true</StartWhenAvailable>" in xml_seen["text"]
     assert "<StopOnIdleEnd>false</StopOnIdleEnd>" in xml_seen["text"]
@@ -312,6 +316,208 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "//B //Nologo" in xml_seen["text"]
     assert "Hermes_Gateway_alice.vbs" in xml_seen["text"]
     assert "cmd.exe" not in xml_seen["text"]
+
+
+def test_logon_trigger_names_the_user_so_an_unelevated_user_can_register_it():
+    """The logon trigger must carry a ``<UserId>`` — a bare trigger means "at every
+    user's logon", which only an administrator may register.
+
+    A logon trigger with no ``<UserId>`` is refused for the unelevated account:
+    ``schtasks /Create /XML`` -> "ERROR: Access is denied." The ``<Principal>``'s
+    ``<UserId>`` does NOT scope the trigger — measured A/B, one element changed.
+    """
+    xml = gateway_windows._build_scheduled_task_xml(
+        r"\Hermes\Hermes_Gateway", Path(r"C:\Hermes\gateway-service\Hermes_Gateway.vbs"), r"DOMAIN\alice",
+    )
+    trigger = xml.split("<LogonTrigger>", 1)[1].split("</LogonTrigger>", 1)[0]
+    assert "<UserId>DOMAIN\\alice</UserId>" in trigger
+    # ...and the principal still names the user.
+    principal = xml.split("<Principal", 1)[1].split("</Principal>", 1)[0]
+    assert "<UserId>DOMAIN\\alice</UserId>" in principal
+
+
+def test_logon_trigger_falls_back_to_the_account_sid(monkeypatch):
+    """A user that cannot be resolved by name still gets a NAMED trigger, never a bare one."""
+    monkeypatch.setattr(gateway_windows, "_resolve_current_user_sid", lambda: "S-1-5-21-1-2-1001")
+    monkeypatch.delenv("USERNAME", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+
+    assert gateway_windows._resolve_task_user() == "S-1-5-21-1-2-1001"
+    xml = gateway_windows._build_scheduled_task_xml(
+        r"\Hermes\Hermes_Gateway", Path(r"C:\Hermes\gateway-service\Hermes_Gateway.vbs"),
+        gateway_windows._resolve_task_user(),
+    )
+    trigger = xml.split("<LogonTrigger>", 1)[1].split("</LogonTrigger>", 1)[0]
+    assert "<UserId>S-1-5-21-1-2-1001</UserId>" in trigger
+
+
+def test_failed_install_does_not_delete_the_working_task(monkeypatch, tmp_path):
+    """A create refused for PERMISSION must never delete the existing task.
+
+    On this host ``/Delete`` succeeds where ``/Create`` is denied, so the old
+    delete-first install destroyed a working supervisor and then reported the
+    failure — leaving the host with no supervisor at all.
+    """
+    calls = []
+    script_path = tmp_path / "Hermes_Gateway.cmd"
+
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: r"DOMAIN\alice")
+
+    def fake_schtasks(args):
+        calls.append(tuple(args))
+        if args[0] == "/Create":
+            return (1, "", "ERROR: Access is denied.")
+        if args[0] == "/Delete":
+            return (0, "SUCCESS: The scheduled task was successfully deleted.", "")
+        raise AssertionError(f"unexpected schtasks args: {args}")
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
+    ok, detail = gateway_windows._install_scheduled_task(r"\Hermes\Hermes_Gateway", script_path)
+
+    assert ok is False
+    assert "Access is denied" in detail
+    assert not [call for call in calls if call[0] == "/Delete"], (
+        "a permission failure must not delete the working task"
+    )
+
+
+def test_corrupt_task_is_deleted_then_recreated(monkeypatch, tmp_path):
+    """A non-permission create failure (a corrupt task) may delete and retry once."""
+    calls = []
+    script_path = tmp_path / "Hermes_Gateway.cmd"
+
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: r"DOMAIN\alice")
+
+    def fake_schtasks(args):
+        calls.append(tuple(args))
+        if args[0] == "/Create":
+            # First create fails as corrupt; the retry (after the delete) succeeds.
+            create_calls = [c for c in calls if c[0] == "/Create"]
+            if len(create_calls) == 1:
+                return (1, "", "ERROR: The task XML contains a value which is incorrectly formatted.")
+            return (0, "SUCCESS", "")
+        if args[0] == "/Delete":
+            return (0, "SUCCESS", "")
+        if args[0] == "/Query":
+            return (1, "", "ERROR: The system cannot find the file specified.")
+        raise AssertionError(f"unexpected schtasks args: {args}")
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
+    ok, detail = gateway_windows._install_scheduled_task(r"\Hermes\Hermes_Gateway", script_path)
+
+    assert ok is True
+    # create (corrupt) -> delete -> create (ok) -> query the legacy root task
+    assert [c[0] for c in calls] == ["/Create", "/Delete", "/Create", "/Query"]
+    assert calls[1][-1] == "\\Hermes\\Hermes_Gateway"
+    assert calls[3][-1] == "Hermes_Gateway"
+
+
+def test_install_never_uses_the_password_prompting_ru_variant(monkeypatch, tmp_path):
+    """``/RU <user> /NP /IT`` makes schtasks PROMPT for a password and then fail; it can
+    never succeed and the swallowed prompt turns the attempt into a silent hang."""
+    calls = []
+    script_path = tmp_path / "Hermes_Gateway.cmd"
+
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: r"DOMAIN\alice")
+
+    def fake_schtasks(args):
+        calls.append(tuple(args))
+        if args[0] == "/Create":
+            return (0, "SUCCESS", "")
+        if args[0] == "/Query":
+            return (1, "", "ERROR: The system cannot find the file specified.")
+        raise AssertionError(f"unexpected schtasks args: {args}")
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
+    ok, _detail = gateway_windows._install_scheduled_task(r"\Hermes\Hermes_Gateway", script_path)
+
+    assert ok is True
+    assert not [arg for call in calls for arg in call if arg == "/RU"]
+    assert not [arg for call in calls for arg in call if arg == "/NP"]
+
+
+def test_schtasks_lookups_use_the_folder_qualified_task_name(monkeypatch):
+    """A task in the ``\\Hermes`` folder is NOT addressed by its bare leaf name.
+
+    Measured: ``schtasks /Query /TN Hermes_Gateway`` returns "cannot find the file" for
+    the task registered at ``\\Hermes\\Hermes_Gateway``. Every schtasks argv must
+    therefore carry the folder, or it silently addresses nothing.
+
+    ``is_task_registered()`` also probes the bare leaf, but only as the LEGACY
+    root-level spelling it may have to clean up — the AUTHORITATIVE lookup is the
+    folder-qualified one.
+    """
+    queried = []
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "get_task_path", lambda: "\\Hermes\\")
+
+    def fake_schtasks(args):
+        queried.append(tuple(args))
+        return (1, "", "ERROR: The system cannot find the file specified.")
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
+    assert gateway_windows.get_task_schtasks_name() == "\\Hermes\\Hermes_Gateway"
+
+    gateway_windows.is_task_registered()
+    gateway_windows.query_task_status()
+    assert gateway_windows.is_task_registered() is False
+
+    qualified = [a for a in queried if a[0] == "/Query" and "\\Hermes\\Hermes_Gateway" in a]
+    assert qualified, "the authoritative lookup must use the folder-qualified name"
+    # The bare leaf is only ever probed as the legacy root-level spelling.
+    for args in queried:
+        if args[0] == "/Query" and args[-1] == "Hermes_Gateway":
+            assert len(args) == 3, "the bare-leaf probe must be a plain /Query /TN <leaf>"
+
+
+def test_is_task_registered_finds_the_folder_qualified_task(monkeypatch):
+    """The authoritative task lives at ``\\Hermes\\Hermes_Gateway``; the bare-leaf query
+    does NOT find it (measured: "The system cannot find the file specified.")."""
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    monkeypatch.setattr(gateway_windows, "get_task_path", lambda: "\\Hermes\\")
+
+    def fake_schtasks(args):
+        if args[0] == "/Query" and args[-1] == "\\Hermes\\Hermes_Gateway":
+            return (0, "TaskName: \\Hermes\\Hermes_Gateway", "")
+        return (1, "", "ERROR: The system cannot find the file specified.")
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
+    assert gateway_windows.is_task_registered() is True
+
+
+def test_root_level_task_of_the_same_leaf_is_removed_after_a_folder_install(monkeypatch, tmp_path):
+    """A root-level task of the same leaf name is the SAME gateway's second launcher.
+
+    Two launchers means two messaging pollers on one token and two writers on one
+    kanban.db — the hazard the parent card t_75aa0341 called out. The install must
+    remove it.
+    """
+    calls = []
+    script_path = tmp_path / "Hermes_Gateway.cmd"
+
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: r"DOMAIN\alice")
+
+    def fake_schtasks(args):
+        calls.append(tuple(args))
+        if args[0] == "/Create":
+            return (0, "SUCCESS", "")
+        if args[0] == "/Delete":
+            return (0, "SUCCESS", "")
+        if args[0] == "/Query":
+            # The root-level task of the same leaf EXISTS.
+            if args[-1] == "Hermes_Gateway":
+                return (0, "TaskName: Hermes_Gateway", "")
+            return (1, "", "ERROR: The system cannot find the file specified.")
+        raise AssertionError(f"unexpected schtasks args: {args}")
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
+    ok, _detail = gateway_windows._install_scheduled_task(r"\Hermes\Hermes_Gateway", script_path)
+
+    assert ok is True
+    deletes = [call for call in calls if call[0] == "/Delete"]
+    assert deletes, "the legacy root-level task must be deleted"
+    assert deletes[0][-1] == "Hermes_Gateway"
 
 
 def test_gateway_vbs_script_is_console_less(monkeypatch):

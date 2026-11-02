@@ -1000,8 +1000,8 @@ class TestWindowsScheduledTaskSupervisorGuard:
         )
         queried = []
 
-        def _fake_supervises(name):
-            queried.append(name)
+        def _fake_supervises(name, path=None):
+            queried.append((name, path))
             return True
 
         monkeypatch.setattr(
@@ -1020,7 +1020,7 @@ class TestWindowsScheduledTaskSupervisorGuard:
 
         assert result is False
         assert killed_pids == []
-        assert queried == ["Hermes_Gateway_testprof"]
+        assert queried == [("Hermes_Gateway_testprof", "\\Hermes\\")]
 
     def test_ready_task_skips_reap(self, monkeypatch):
         """Ready is the post-launcher steady state — still supervised (#87001)."""
@@ -1033,7 +1033,7 @@ class TestWindowsScheduledTaskSupervisorGuard:
             gateway_windows, "get_task_name", lambda: "Hermes_Gateway_testprof"
         )
         monkeypatch.setattr(
-            gateway, "_windows_scheduled_task_state", lambda name: "Ready"
+            gateway, "_windows_scheduled_task_state", lambda name, path=None: "Ready"
         )
 
         def _boom_find_gateway_pids(exclude_pids=None):
@@ -1056,7 +1056,7 @@ class TestWindowsScheduledTaskSupervisorGuard:
         monkeypatch.setattr(gateway, "is_windows", lambda: True)
         monkeypatch.setattr(gateway, "is_macos", lambda: False)
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-        monkeypatch.setattr(gateway, "_windows_scheduled_task_supervises", lambda name: False)
+        monkeypatch.setattr(gateway, "_windows_scheduled_task_supervises", lambda name, path=None: False)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
         monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
 
@@ -1095,8 +1095,46 @@ class TestWindowsScheduledTaskSupervisorGuard:
         states = {"Running": True, "Ready": True, "Queued": True, "Disabled": False, "MISSING": False}
 
         for state, expected in states.items():
-            monkeypatch.setattr(gateway, "_windows_scheduled_task_state", lambda name, s=state: s)
+            monkeypatch.setattr(gateway, "_windows_scheduled_task_states", lambda name, path=None, s=state: [s])
             assert gateway._windows_scheduled_task_supervises("Hermes_Gateway") is expected, state
+
+    def test_ambiguous_task_lookup_still_counts_as_supervised(self, monkeypatch):
+        """Two tasks of the same leaf name -> two States. The guard exists to AVOID killing a
+        live gateway, so an ambiguous answer must fail SAFE (supervised), not kill."""
+        monkeypatch.setattr(gateway, "is_windows", lambda: True)
+        monkeypatch.setattr(
+            gateway, "_windows_scheduled_task_states", lambda name, path=None: ["Ready", "Disabled"]
+        )
+        assert gateway._windows_scheduled_task_supervises("Hermes_Gateway") is True
+        # ...but a single-state answer is unambiguous and reported as such.
+        assert gateway._windows_scheduled_task_state("Hermes_Gateway") is None
+
+    def test_supervisor_lookup_passes_the_task_folder(self, monkeypatch):
+        """The PowerShell lookup must carry the Task Scheduler FOLDER: an unqualified
+        -TaskName matches that leaf name in EVERY folder (measured: "Ready\\nReady")."""
+        monkeypatch.setattr(gateway, "is_windows", lambda: True)
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        import hermes_cli.gateway_windows as gateway_windows
+
+        monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_testprof")
+        monkeypatch.setattr(gateway_windows, "get_task_path", lambda: "\\Hermes\\")
+        seen = []
+
+        def _fake_supervises(name, path=None):
+            seen.append((name, path))
+            return True
+
+        monkeypatch.setattr(gateway, "_windows_scheduled_task_supervises", _fake_supervises)
+
+        def _boom_find_gateway_pids(exclude_pids=None):
+            raise AssertionError("must not scan when scheduled task supervises")
+
+        monkeypatch.setattr(gateway, "find_gateway_pids", _boom_find_gateway_pids)
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: None)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is False
+        assert seen == [("Hermes_Gateway_testprof", "\\Hermes\\")]
 
 
 def test_find_windows_gateway_services_maps_verified_pid_tree(monkeypatch):
