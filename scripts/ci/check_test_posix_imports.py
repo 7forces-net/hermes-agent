@@ -233,6 +233,26 @@ import time  # noqa: E402
 import unittest  # noqa: E402
 import warnings  # noqa: E402
 
+# ── make the host LOOK like Windows ─────────────────────────────────────────
+# The simulation has to fake the host, not just the module table. A module
+# that guards itself with ``os.name == "nt"`` or ``sys.platform == "win32"``
+# takes its POSIX branch on a Linux runner, so the POSIX-only reference it
+# protects is evaluated and reported as a defect that does not exist on a
+# real Windows host (where the guard short-circuits).
+#
+# Faking the host is exactly what this repo's test policy warns about for
+# RUNTIME behaviour -- but here the fake is the POINT: the question is
+# "would this module import on Windows", and the honest way to answer it is
+# to make the interpreter's own view of the host match. The behaviour under
+# test (import-time evaluation) is not faked.
+#
+# ``os.name`` and ``sys.platform`` are the two the tree keys on. Both are
+# plain module attributes, so they can be set for the duration of the probe.
+_REAL_OS_NAME = os.name
+_REAL_SYS_PLATFORM = sys.platform
+os.name = "nt"
+sys.platform = "win32"
+
 # Remove the os attributes Windows does not have. This is safe to do
 # globally: no stdlib module reaches for os.geteuid and friends at import
 # time, and it is exactly the shape of the defect being guarded.
@@ -298,6 +318,11 @@ for _index, _rel in enumerate(MODULES):
 # is never unwound), which would swallow the marker and lose every result.
 with open(RESULTS_PATH, "w", encoding="utf-8") as _fh:
     json.dump(results, _fh)
+
+# Restore the real host before exiting, so nothing downstream of this probe
+# in the same process sees a faked platform.
+os.name = _REAL_OS_NAME
+sys.platform = _REAL_SYS_PLATFORM
 '''
 
 
