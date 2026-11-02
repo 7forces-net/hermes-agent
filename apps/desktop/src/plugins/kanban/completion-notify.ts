@@ -34,6 +34,7 @@ import {
   clipText,
   crashedCauseLabel,
   protocolViolationCauseLabel,
+  providerHint,
   reclaimedCauseLabel,
   timedOutCauseLabel
 } from './notice-cause'
@@ -234,7 +235,13 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
     // the card WITHOUT counting a failure, so the breaker does not trip and
     // the task is retried. The body says exactly that, plus the operator's
     // call to action (add credits / switch provider).
-    return t('notify.rateLimitedBody')
+    //
+    // The call to action is the PRODUCER's extract, carried on the payload
+    // as `provider_hint` — the renderers cannot read the worker's log, so
+    // without it the toast could only name the cause and never the remedy.
+    const hint = providerHint(payload)
+
+    return hint ? `${t('notify.rateLimitedBody')} ${hint}` : t('notify.rateLimitedBody')
   }
 
   if (kind === 'timed_out') {

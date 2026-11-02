@@ -1180,6 +1180,62 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     return " ".join(lines)[-400:]
 
 
+# How much of the worker log the quota-wall hint reader looks at.
+#
+# MEASURED (2026-11-02, on the live ``gamedev`` board's 12 rate-limited worker
+# logs, reconstructed at reclaim time): the provider's remedy panel sits at
+# most 4096 bytes back from the END of the reclaim-time log — 768 bytes for
+# the 10 attempts that reached the out-of-credits fallback, 4096 for the
+# worst case. A 4 KiB tail covers every measured case; 8 KiB is the round
+# number chosen so a slightly longer panel still fits.
+#
+# The window is deliberately small. The log of a long-running card grows
+# without bound (measured: up to 1.2 MB for a card that retried 195 times),
+# and the reclaim path runs for every dead worker — so the read must not
+# scale with the log's age.
+_RATE_LIMITED_HINT_LOG_BYTES = 8192
+
+
+def _rate_limited_provider_hint(task_id: str, board: Optional[str] = None) -> str:
+    """The actionable provider hint from a rate-limited worker's log; "" if none.
+
+    A provider quota wall has exactly ONE remedy — add credits to the provider
+    that is out of credits, or switch providers — and the provider says so
+    verbatim in the worker's log ("Add credits with Custom:Minimax Oauth
+    Fallback. Or switch providers with /model <model> --provider
+    <provider>."). That text is the entire operational payload of a quota
+    wall, and without it the notification can only say WHAT happened, never
+    what to DO.
+
+    This is why the producer reads the log: the renderers cannot. They see
+    the event payload and nothing else, so if the payload does not carry the
+    hint, no renderer can ever show it. That was the defect this closes —
+    measured on the live board, 0 of 1682 ``rate_limited`` payloads carried
+    ``worker_output``, because the producer deliberately skipped it.
+
+    The extraction itself lives in ``hermes_cli.kanban_notice`` (the shared
+    helper both the producer and the renderers use), so the producer and the
+    renderer cannot disagree about what the hint is.
+
+    Returns "" (never raises) when the log is missing, unreadable, or carries
+    no actionable text — a quota wall without a hint is still a quota wall.
+    """
+    try:
+        raw = _kb.read_worker_log(
+            task_id, tail_bytes=_RATE_LIMITED_HINT_LOG_BYTES, board=board,
+        )
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    try:
+        from hermes_cli.kanban_notice import extract_rate_limited_hint
+
+        return extract_rate_limited_hint(raw)
+    except Exception:
+        return ""
+
+
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1207,7 +1263,19 @@ def _classify_dead_worker(
 
     A clean exit or a crash carries the worker's own last output (``worker_output``
     in the event payload, appended to the error text) so the board and the retry
-    worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+    worker see WHY instead of a bare label.
+
+    A rate-limited run carries the ACTIONABLE PROVIDER HINT instead
+    (``provider_hint``): a quota wall has exactly one remedy — add credits to
+    the provider that is out of credits, or switch providers — and the
+    provider states it verbatim in the worker's log. The renderers CANNOT
+    read that log, so if the producer does not carry it, no renderer can ever
+    show it: measured on the live board, 0 of 1682 ``rate_limited`` payloads
+    carried ``worker_output``, so every renderer reported the quota wall
+    WITHOUT the remedy.
+
+    Only the extracted hint is carried, never the raw multi-KB panel: the
+    payload is stored in the board DB forever.
     """
     dead = _classify_dead_worker_exit(pid, claimer, conn=conn, task_id=task_id)
     if task_id and not dead.rate_limited:
@@ -1215,6 +1283,10 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
+    elif task_id and dead.rate_limited:
+        hint = _rate_limited_provider_hint(task_id, board=board)
+        if hint:
+            dead.event_payload["provider_hint"] = hint
     return dead
 
 

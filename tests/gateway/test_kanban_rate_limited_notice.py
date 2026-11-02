@@ -14,10 +14,15 @@ Measured on the live ``gamedev`` board (2026-11-02):
 * 1682 ``rate_limited`` events vs 2 ``crashed`` events (838:1);
 * 1682 events across 10 cards, 640 of them still unclaimed behind 4
   subscription cursors;
-* the payload shape is exactly ``{pid, claimer, exit_code, retry_status}`` —
-  and **0 of 1682** carry ``worker_output``, because the producer skips it for
-  rate-limited runs (``if task_id and not dead.rate_limited``). The renderer
-  must therefore treat the provider hint as OPTIONAL, not assume it.
+* the payload shape was exactly ``{pid, claimer, exit_code, retry_status}``
+  — and **0 of 1682** carried ``worker_output``, because the producer
+  skipped it for rate-limited runs (``if task_id and not dead.rate_limited``).
+  So the renderer had to treat the provider hint as OPTIONAL, not assume it.
+
+FOLLOW-THROUGH (t_fadaa4aa): the producer now carries the extracted remedy on
+the payload as ``provider_hint``, so the hint is live rather than hypothetical.
+The renderer reads that key first and keeps ``worker_output`` as the fallback
+for payloads written before the change.
 
 The rule these tests lock in, in every renderer:
 
@@ -319,6 +324,119 @@ def test_the_provider_hint_is_absent_when_the_payload_has_none():
     ):
         assert "Add credits" not in message, message
         assert "switch providers" not in message, message
+
+
+# ---------------------------------------------------------------------------
+# 3b. The PRODUCER-carried hint (the live path)
+#
+# The producer now puts the extracted remedy on the payload as
+# ``provider_hint`` (t_fadaa4aa). Before that, the payload carried NOTHING
+# extractable — 0 of 1682 live ``rate_limited`` payloads had
+# ``worker_output`` — so every renderer reported the quota wall WITHOUT the
+# remedy, and the operator had to guess which provider was out of credits.
+#
+# The renderers must read the new key. The ``worker_output`` path stays as
+# the fallback for payloads written before the change.
+# ---------------------------------------------------------------------------
+
+# The hint as the producer carries it: extracted, ANSI-free, already clipped.
+CARRIED_HINT = (
+    "Add credits with Custom:Minimax Oauth Fallback. "
+    "Or switch providers with /model <model> --provider <provider>."
+)
+
+
+def test_the_producer_carried_hint_reaches_both_renderers():
+    """The live path: the payload's ``provider_hint`` is rendered."""
+    payload = {**LIVE_PAYLOAD, "provider_hint": CARRIED_HINT}
+
+    for message in (
+        _gateway_msg("rate_limited", payload),
+        _tui_text("rate_limited", payload),
+    ):
+        assert "Add credits" in message, message
+        assert "switch providers" in message, message
+        assert "Custom:Minimax Oauth Fallback" in message, message
+
+
+def test_the_two_renderers_agree_on_the_carried_hint():
+    """The carried hint must not make the two renderers drift.
+
+    The shared clause is the copy both renderers build from the SAME
+    helper, so a payload that carries the hint produces byte-identical
+    wording on both sides.
+    """
+    payload = {**LIVE_PAYLOAD, "provider_hint": CARRIED_HINT}
+
+    shared = f"{rate_limited_cause(payload)}: {rate_limited_detail(payload)}"
+    gateway_msg = _gateway_msg("rate_limited", payload)
+    tui_text = _tui_text("rate_limited", payload)
+
+    assert shared in gateway_msg, (shared, gateway_msg)
+    assert shared in tui_text, (shared, tui_text)
+
+    gateway_copy = gateway_msg.split("— ", 1)[1].split(". Logs: `", 1)[0]
+    tui_copy = tui_text.split("Kanban t_abc", 1)[1].strip()
+    assert gateway_copy == tui_copy, (gateway_copy, tui_copy)
+
+
+def test_the_carried_hint_is_clipped_and_never_leaks_ansi():
+    """A carried hint is bounded and ANSI-free, exactly like an extracted one."""
+    payload = {
+        **LIVE_PAYLOAD,
+        "provider_hint": "\x1b[31mAdd credits with X.\x1b[0m " + "Z" * 5000,
+    }
+
+    for message in (
+        _gateway_msg("rate_limited", payload),
+        _tui_text("rate_limited", payload),
+    ):
+        assert "\x1b[" not in message, repr(message)
+        assert "Z" * 5000 not in message
+        assert len(message) < 800, len(message)
+
+
+def test_the_carried_hint_never_names_a_pid_or_a_claimer():
+    """A hint is operator copy; it must not leak the payload's machine keys."""
+    payload = {**LIVE_PAYLOAD, "provider_hint": CARRIED_HINT}
+
+    for message in (
+        _gateway_msg("rate_limited", payload),
+        _tui_text("rate_limited", payload),
+    ):
+        assert "16932" not in message, message
+        assert "DESKTOP-7G7SGH3" not in message, message
+
+
+def test_a_malformed_carried_hint_never_raises():
+    """A malformed ``provider_hint`` must not break the notification."""
+    for bad in (None, 12345, [], {"a": 1}, "   "):
+        payload = {**LIVE_PAYLOAD, "provider_hint": bad}
+        gateway_msg = _gateway_msg("rate_limited", payload)
+        assert gateway_msg, bad
+        tui_text = _tui_text("rate_limited", payload)
+        assert tui_text, bad
+
+
+def test_the_carried_hint_wins_over_a_stale_worker_output():
+    """``provider_hint`` is the extracted remedy; it is the live path.
+
+    When a payload carries both, the carried hint is authoritative — it is
+    the producer's own extraction of the LATEST attempt, whereas
+    ``worker_output`` may be from an earlier one.
+    """
+    payload = {
+        **LIVE_PAYLOAD,
+        "provider_hint": CARRIED_HINT,
+        "worker_output": "Add credits with Some Old Provider.",
+    }
+
+    for message in (
+        _gateway_msg("rate_limited", payload),
+        _tui_text("rate_limited", payload),
+    ):
+        assert "Custom:Minimax Oauth Fallback" in message, message
+        assert "Some Old Provider" not in message, message
 
 
 def test_the_hint_is_ansi_stripped_and_clipped():

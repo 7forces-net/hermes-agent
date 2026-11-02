@@ -241,6 +241,61 @@ def test_read_worker_log_tail(kanban_home):
     assert kb.read_worker_log("t_missing") is None
 
 
+def test_read_worker_log_tail_never_returns_empty_for_a_log_that_exists(kanban_home):
+    """The tail window must not be swallowed by the partial-first-line skip.
+
+    ``readline()`` runs to EOF when the window holds no newline at all — and
+    it ALSO runs to EOF when the only newline in the window is the file's
+    LAST byte. The old code only seeked back in the first case, so the
+    second case returned an EMPTY string for a log that exists.
+
+    That is not cosmetic: the dispatcher's crash path reads the worker's
+    last words through this function, and the quota-wall hint reader reads
+    the provider's remedy through it. An empty tail silently dropped both.
+    """
+    log_dir = kanban_home / "kanban" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # (a) the file's LAST byte is a newline and the window starts inside the
+    #     final line. ``readline()`` then reads the rest of the file (one
+    #     newline, at EOF), so the old code consumed the WHOLE window and
+    #     returned an empty string for a log that exists.
+    p = log_dir / "t_endsnl.log"
+    p.write_text("head\n" + ("x" * 200) + "\n")
+    tail = kb.read_worker_log("t_endsnl", tail_bytes=16)
+    assert tail, "a tail window must not be swallowed by the partial-line skip"
+    assert "x" in tail
+
+    # (b) the window holds no newline at all.
+    p1 = log_dir / "t_nonl.log"
+    p1.write_text("Add credits with Foo.")
+    tail1 = kb.read_worker_log("t_nonl", tail_bytes=16)
+    assert tail1, "a tail window with no newline must not be swallowed"
+    # The window is a BYTE window, so it may start mid-line; what matters is
+    # that it carries the file's last bytes rather than nothing at all.
+    assert tail1 == "redits with Foo.", tail1
+
+    # (c) the only newline in the window is the file's LAST byte: the
+    #     final line is longer than the window.
+    p2 = log_dir / "t_longlast.log"
+    p2.write_text("head\n" + ("x" * 200))
+    tail2 = kb.read_worker_log("t_longlast", tail_bytes=16)
+    assert tail2, "a tail window whose only newline is the last byte must not be swallowed"
+    assert tail2 == "x" * 16, tail2
+
+
+def test_read_worker_log_tail_still_drops_the_partial_first_line(kanban_home):
+    """The fix must not reintroduce the partial line it was meant to drop."""
+    log_dir = kanban_home / "kanban" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    p = log_dir / "t_partial.log"
+    p.write_text("first line\nsecond line\nthird line\n")
+    tail = kb.read_worker_log("t_partial", tail_bytes=20)
+    assert tail is not None
+    assert "first line" not in tail
+    assert "third line" in tail
+
+
 # ---------------------------------------------------------------------------
 # CLI bulk verbs
 # ---------------------------------------------------------------------------

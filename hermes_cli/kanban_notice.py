@@ -55,6 +55,7 @@ __all__ = [
     "rate_limited_cause",
     "rate_limited_detail",
     "rate_limited_hint",
+    "extract_rate_limited_hint",
     "RATE_LIMITED_CAUSE",
 ]
 
@@ -426,11 +427,15 @@ RATE_LIMITED_CAUSE = "its worker hit a provider quota wall (rate limited)"
 # providers with /model <model> --provider <provider>." — the text that tells
 # the operator what to actually DO. It is only useful if it survives clipping.
 #
-# NOTE (measured 2026-11-02): the live board's 1682 ``rate_limited`` payloads
-# carry NO ``worker_output`` — the producer skips it for rate-limited runs on
-# purpose (``if task_id and not dead.rate_limited``). So this helper is correct
-# and the hint is simply absent on those rows. It is rendered whenever a
-# payload DOES carry one, which is what the acceptance criteria ask for.
+# LIVE PATH (2026-11-02, t_fadaa4aa): the producer puts the extracted hint on
+# the event payload as ``provider_hint``. Before that, the producer SKIPPED
+# ``worker_output`` for rate-limited runs, so the hint was unreachable no
+# matter how well this module extracted it: measured on the live ``gamedev``
+# board, 0 of 1682 ``rate_limited`` payloads carried ``worker_output``, so
+# every renderer reported the quota wall WITHOUT the remedy. The producer now
+# carries the hint itself; this module reads it from ``provider_hint`` and
+# falls back to ``worker_output`` for payloads written before that change.
+#
 # The provider's ACTIONABLE sentences. These are the calls to action the
 # operator can actually take ("add credits", "switch providers"), not the
 # descriptive ones ("the usage limit has been reached") — the cause clause
@@ -469,8 +474,16 @@ def rate_limited_hint(payload: Any) -> str:
     """The actionable provider hint from the payload, clipped; "" when absent.
 
     The hint is the operator's call to action ("add credits", "switch
-    provider"). It is extracted from ``worker_output`` — the worker's own last
-    words — because that is where the provider puts it.
+    provider"). It is read from the payload in this order:
+
+    1. ``provider_hint`` — the ALREADY-EXTRACTED hint the producer puts on
+       the event. This is the live path: the producer reads the worker's log
+       and extracts the remedy itself (see
+       ``hermes_cli/kanban_db_dispatch.py``), because the renderers cannot
+       reach the log.
+    2. ``worker_output`` — the worker's own last words, extracted here. This
+       is the fallback for payloads written before the producer carried the
+       hint, and for any payload that still carries raw output.
 
     Only the ACTIONABLE sentences are returned, not the tail of the raw
     output: the raw worker output is a rendered panel full of box-drawing
@@ -483,6 +496,21 @@ def rate_limited_hint(payload: Any) -> str:
     """
     if not isinstance(payload, dict):
         return ""
+    carried = payload.get("provider_hint")
+    if isinstance(carried, str) and carried.strip():
+        # The producer's own extraction is already ANSI-free, but the
+        # renderer must never EMIT ANSI — a payload is data, and data can
+        # carry escape sequences. Strip them here rather than trusting the
+        # producer, so a malformed payload cannot paint the operator's
+        # terminal.
+        hint = _ANSI_RE.sub("", carried).strip()
+        hint = _ORPHAN_SGR_RE.sub(" ", hint)
+        hint = " ".join(hint.split())
+        if not hint:
+            return ""
+        if len(hint) > _RATE_LIMITED_HINT_LIMIT:
+            hint = hint[: _RATE_LIMITED_HINT_LIMIT - 1].rstrip() + "…"
+        return hint
     raw = payload.get("worker_output")
     if not isinstance(raw, str) or not raw.strip():
         return ""
@@ -510,6 +538,104 @@ def rate_limited_hint(payload: Any) -> str:
     if not parts:
         return ""
     hint = " ".join(parts)
+    if len(hint) > _RATE_LIMITED_HINT_LIMIT:
+        hint = hint[: _RATE_LIMITED_HINT_LIMIT - 1].rstrip() + "…"
+    return hint
+
+
+def extract_rate_limited_hint(text: Any) -> str:
+    """The actionable provider hint inside raw worker text; ``""`` when absent.
+
+    This is the PRODUCER-side extraction: it takes the worker's raw log text
+    (ANSI, box chrome and all) and returns the operator's call to action.
+
+    Why a separate function rather than reusing :func:`rate_limited_hint`:
+    that one reads a PAYLOAD, this one reads TEXT. The producer has the raw
+    log text at hand and must decide what to put on the payload; the renderer
+    has the payload and must decide what to print. Keeping the two apart
+    means the producer can carry the already-extracted hint, and the renderer
+    can still fall back to extracting it from a raw ``worker_output``.
+
+    WHICH hint matters, and this is the part a naive extraction gets wrong.
+    A rate-limited attempt usually hits TWO providers in sequence:
+
+      1. the PRIMARY provider returns 429 ("upgrade your plan:
+         https://kimi.com/..."), the agent switches to the fallback;
+      2. the FALLBACK provider is out of credits ("Add credits with
+         Custom:Minimax Oauth Fallback.").
+
+    The provider that is actually out of CREDITS is the LAST one — the
+    fallback. A first-match extraction names the provider that merely
+    rate-limited and was already switched away from, so the operator is told
+    to top up a provider that is working.
+
+    Two rules make the LAST remedy win:
+
+    1. LINES first, sentences second. The provider prints its remedy on its
+       own lines. Flattening the whole text into one string glues the
+       primary's 429 line to the fallback's remedy line, and the merged
+       "sentence" then starts with the primary's marker — so the extraction
+       names the primary again. Splitting by line keeps the two apart.
+    2. the LAST run of actionable chunks, not the first. The last statement
+       of the remedy is the one that names the provider still out of
+       credits.
+
+    Measured on the live board's 12 rate-limited worker logs (reconstructed
+    at reclaim time): a first-match, flat-text extraction names ``kimi``
+    (the primary) in 10 of 12 cases; this one names ``minimax`` (the
+    fallback that is out of credits) in those same 10, and ``kimi`` in the
+    2 attempts that never reached the fallback.
+
+    The run is capped at its LAST TWO chunks: the provider's remedy is a
+    PAIR ("Add credits with X." / "Or switch providers with /model ..."), and
+    the pair is the last statement of it. Longer runs are the same panel
+    repeated (the worker prints the block several times per attempt), and
+    repeating it is noise, not signal.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    clean = _ANSI_RE.sub("", text)
+    clean = _ORPHAN_SGR_RE.sub(" ", clean)
+    # LINE first, then sentence inside the line: the provider's remedy is
+    # printed as its own lines, and flattening first would merge the
+    # primary's 429 line with the fallback's remedy line.
+    chunks: list[str] = []
+    for line in clean.splitlines():
+        line = " ".join(line.split())
+        if not line:
+            continue
+        for chunk in re.split(r"(?<=[.!])\s+", line):
+            chunk = chunk.strip()
+            if chunk:
+                chunks.append(chunk)
+    if not chunks:
+        return ""
+    actionable = [
+        any(marker in chunk.lower() for marker in _RATE_LIMITED_HINT_MARKERS)
+        for chunk in chunks
+    ]
+    if not any(actionable):
+        return ""
+    # The LAST run of actionable chunks — the most recent statement of the
+    # remedy, which names the provider that is actually out of credits.
+    last = max(i for i, flag in enumerate(actionable) if flag)
+    start = last
+    while start - 1 >= 0 and actionable[start - 1]:
+        start -= 1
+    run = chunks[start: last + 1]
+    # The remedy is a PAIR; keep the last two chunks of the run.
+    chosen = list(run[-2:])
+    first = chosen[0]
+    low = first.lower()
+    matched = [m for m in _RATE_LIMITED_HINT_MARKERS if m in low]
+    start_at = min(low.index(m) for m in matched)
+    if start_at > _RATE_LIMITED_HINT_LEADIN:
+        # Keep the INSTRUCTION, not the prose in front of it: start the chunk
+        # at the marker so a long lead-in cannot push the actionable words
+        # past the clip budget.
+        first = first[start_at:].lstrip()
+    chosen[0] = first
+    hint = " ".join(chunk for chunk in chosen if chunk)
     if len(hint) > _RATE_LIMITED_HINT_LIMIT:
         hint = hint[: _RATE_LIMITED_HINT_LIMIT - 1].rstrip() + "…"
     return hint

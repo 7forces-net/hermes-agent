@@ -892,6 +892,66 @@ describe('provider quota wall', () => {
     expect(notify.message).not.toContain('DESKTOP-7G7SGH3')
   })
 
+  it("the PRODUCER's provider hint reaches the toast", async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    // The producer extracts the remedy from the worker's log and carries it
+    // on the payload (`provider_hint`). The renderers cannot read that log,
+    // so this is the ONLY path by which the operator learns WHICH provider
+    // is out of credits. Before it existed, 0 of 1682 live `rate_limited`
+    // payloads carried anything extractable.
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'rate_limited', {
+        pid: 16932,
+        claimer: 'DESKTOP-7G7SGH3:18860',
+        exit_code: 75,
+        provider_hint:
+          'Add credits with Custom:Minimax Oauth Fallback. Or switch providers with /model <model> --provider <provider>.'
+      })
+    ])
+
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+    const notify = lastNotify()
+    expect(notify.message).toContain('Add credits with Custom:Minimax Oauth Fallback')
+    expect(notify.message).toContain('switch providers')
+    // Still not a crash, and still no pid / claimer.
+    expect(notify.message.toLowerCase()).not.toContain('crash')
+    expect(notify.message).not.toContain('16932')
+    expect(notify.message).not.toContain('DESKTOP-7G7SGH3')
+  })
+
+  it('a carried hint is clipped and never leaks ANSI', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'rate_limited', {
+        exit_code: 75,
+        provider_hint: `\u001b[31mAdd credits with X.\u001b[0m ${'Z'.repeat(5000)}`
+      })
+    ])
+
+    const notify = lastNotify()
+    expect(notify.message).not.toContain('\u001b[')
+    expect(notify.message).not.toContain('Z'.repeat(5000))
+    expect(notify.message.length).toBeLessThan(600)
+  })
+
+  it('a quota wall WITHOUT a hint still renders the cause', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    // The log may be unreadable, or the provider may print no remedy. The
+    // quota wall is still a quota wall — the toast must not vanish.
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'rate_limited', { exit_code: 75 })])
+
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+    const notify = lastNotify()
+    expect(notify.message.toLowerCase()).toContain('quota')
+    expect(notify.message.toLowerCase()).not.toContain('crash')
+  })
+
   it('a standing wall toasts ONCE, not once per retry', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)

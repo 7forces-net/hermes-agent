@@ -4112,10 +4112,18 @@ def read_worker_log(
         with open(path, "rb") as f:
             if size > tail_bytes:
                 f.seek(size - tail_bytes)
-                # Skip the partial first line unless the window has no newline
-                # at all (readline() would eat everything).
+                # Skip the partial first line, but never at the cost of the
+                # WHOLE window. ``readline()`` runs to EOF when the window
+                # holds no newline, and it also runs to EOF when the only
+                # newline in the window is the file's LAST byte (a log whose
+                # final line is longer than the window). In both cases
+                # seeking back keeps the window; without it the caller got
+                # an EMPTY string for a log that exists — which silently
+                # dropped the worker's last words from the crash payload and
+                # the provider's remedy from the quota-wall payload.
                 probe = f.tell()
-                if not f.readline().endswith(b"\n") and f.tell() >= size:
+                f.readline()
+                if f.tell() >= size:
                     f.seek(probe)
             return f.read().decode("utf-8", errors="replace")
     except OSError:

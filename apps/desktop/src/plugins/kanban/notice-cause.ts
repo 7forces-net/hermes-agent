@@ -207,6 +207,42 @@ export function timedOutCauseLabel(
   return null
 }
 
+/** The actionable provider hint the PRODUCER carries on a quota-wall event.
+ *
+ *  A provider quota wall has exactly one remedy — add credits to the provider
+ *  that is out of credits, or switch providers — and the provider states it
+ *  verbatim in the worker's log:
+ *
+ *      Add credits with Custom:Minimax Oauth Fallback.
+ *      Or switch providers with /model <model> --provider <provider>.
+ *
+ *  The renderers cannot read the worker's log, so the producer extracts the
+ *  remedy and puts it on the event payload as `provider_hint`
+ *  (`hermes_cli/kanban_db_dispatch.py`). Before that, the payload carried
+ *  NOTHING extractable — measured on the live board, 0 of 1682
+ *  `rate_limited` payloads carried `worker_output` — so this plugin could
+ *  never show the remedy, and the operator had to guess which provider was
+ *  out of credits.
+ *
+ *  There is deliberately NO `worker_output` fallback here: for a quota wall
+ *  the producer never carried raw output either (0 of 1682), so there is no
+ *  older payload to recover a hint from. Mirroring the Python extraction
+ *  rule across the language boundary would duplicate a sentence-splitting
+ *  rule in two languages — the exact drift the shared Python helper exists
+ *  to prevent — for no payload that exists.
+ *
+ *  The text is provider-authored, so it is shown verbatim (clipped and
+ *  ANSI-stripped), never re-worded. */
+export function providerHint(payload: Record<string, unknown> | null | undefined): string {
+  const raw = payload?.provider_hint
+
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return ''
+  }
+
+  return clipText(raw, 200)
+}
+
 /** Guard: a rendered cause must never leak a machine token (`nonzero_exit`)
  *  or a pid/claimer. Used by the tests and cheap enough to keep in the
  *  production path as a last-resort scrub. */
