@@ -2051,6 +2051,59 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+# Block kinds that represent a HUMAN GATE. A watchdog, a cron script or any
+# other automated sweeper must NEVER release these: the card was parked on
+# purpose, and the person who parked it is the only one who may release it.
+#
+#   needs_input  - a person must answer a question / give sign-off
+#   capability   - no agent can do this (a paid filing, an account, a login)
+#
+# These two are exactly the kinds the card-level ``block_kind`` column
+# records, and they are what makes a human-approval block distinguishable
+# from a worker that merely stalled. ``dependency`` and ``transient`` are
+# mechanical: they resolve on their own, so an automated rescue is safe.
+HUMAN_GATE_BLOCK_KINDS = frozenset({"needs_input", "capability"})
+
+
+def block_is_human_gate(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's newest block is a HUMAN GATE that no automated
+    sweeper may release.
+
+    Two independent signals are consulted, because either alone is
+    insufficient:
+
+    1. ``tasks.block_kind`` — the column ``block_task`` writes. ``needs_input``
+       and ``capability`` are human gates by definition.
+    2. The newest ``blocked`` event's payload ``kind`` — the same signal for
+       cards whose column was reset by an unblock/re-block cycle, or written
+       by an older client that only populated the event.
+
+    A card with NO recorded kind (``None``) is NOT a human gate: the legacy
+    ``kanban_block(reason=...)`` without a kind is a worker giving up, which
+    is the mechanical case a watchdog may rescue.
+
+    See ``hermes_cli.kanban_watchdog`` for the consumer, and
+    ``tests/hermes_cli/test_kanban_human_gate_blocks.py`` for the contract.
+    """
+    row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is not None and _row_get(row, "block_kind") in HUMAN_GATE_BLOCK_KINDS:
+        return True
+    # The event payload is the fallback: an unblock deliberately PRESERVES
+    # block_kind, but a direct DB edit or an older client may not have set
+    # the column at all while still recording the kind in the event.
+    ev = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if ev is None:
+        return False
+    payload = _json_dict(_row_get(ev, "payload"))
+    return isinstance(payload, dict) and payload.get("kind") in HUMAN_GATE_BLOCK_KINDS
+
+
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
@@ -2681,6 +2734,17 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    # The ``result`` COLUMN is the durable "what did this card do" record; it
+    # is what the dashboard, the CLI ``list`` output and every downstream
+    # reader sees. Workers normally pass only ``summary`` (the tool schema
+    # makes ``result`` optional and ``summary`` preferred), so the column
+    # used to stay NULL/empty even though a rich handoff existed on the run
+    # row — a completed card that recorded nothing.
+    #
+    # Mirror the summary into ``result`` when no explicit result was given.
+    # An explicit ``result`` always wins; this only fills the gap.
+    if not (result or "").strip() and handoff_summary:
+        result = handoff_summary
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False

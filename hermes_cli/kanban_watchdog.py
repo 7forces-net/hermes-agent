@@ -593,6 +593,15 @@ def _do_recover(conn, report: WatchdogReport, settings: WatchdogSettings) -> Non
       card the breaker just tripped, hand it straight back to a worker, and
       the card would crash forever — the watchdog would become the loop that
       keeps the breaker from ever latching.
+
+    * **A HUMAN GATE is never released.**  A ``blocked`` card whose kind is
+      ``needs_input`` or ``capability`` was parked ON PURPOSE, waiting for a
+      person.  "Sticky" alone is not enough of a signal: a legacy
+      ``kanban_block(reason=...)`` with no kind is a worker giving up (safe to
+      recover), while a ``needs_input`` block is a human decision (never safe
+      to recover without the human).  ``kb.block_is_human_gate`` reads the
+      card's ``block_kind`` column and the newest ``blocked`` event's payload
+      so the two are never confused.
     """
     rows = conn.execute(
         "SELECT id, title, assignee, status, consecutive_failures, max_retries "
@@ -613,6 +622,24 @@ def _do_recover(conn, report: WatchdogReport, settings: WatchdogSettings) -> Non
         if last_status != "crashed" and last_outcome != "crashed":
             continue
         if row["status"] == "blocked":
+            # A HUMAN GATE is an explicit "this card waits for a person" —
+            # sign-off, a missing credential, a paid filing. Neither the
+            # watchdog nor any cron script may release it: the user is the
+            # sole approver for money, legal and publishing decisions. This
+            # is checked BEFORE the sticky-block check because it is the
+            # stronger guarantee, and it applies to every block kind.
+            if kb.block_is_human_gate(conn, task_id):
+                report.stuck.append({
+                    "task_id": task_id,
+                    "reason": "human_gate",
+                    "detail": (
+                        "blocked on a human gate (needs_input/capability) — "
+                        "only the user may release it"
+                    ),
+                    "assignee": row["assignee"],
+                    "title": row["title"],
+                })
+                continue
             # A sticky block is an EXPLICIT "this card is parked" — a human
             # decision (or a worker's own block). The watchdog reports it and
             # leaves it alone; only an operator may release it.
