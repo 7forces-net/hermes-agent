@@ -1591,3 +1591,113 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---------------------------------------------------------------------------
+ * Approvals — the approval centre section
+ *
+ * Shows every card waiting on the owner, how long it has waited, and
+ * whether it has passed the 48h reminder or the 7d blocked threshold.
+ * The thresholds come from the backend (board.json approval_center), so
+ * the colours and the cadence can never disagree.
+ * --------------------------------------------------------------------------- */
+.hermes-kanban-approval-list {
+  border-top: 1px solid rgba(120, 120, 140, 0.2);
+  padding: 0.25rem 0;
+}
+.hermes-kanban-approval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8125rem;
+  border-left: 3px solid transparent;
+}
+.hermes-kanban-approval-card:hover {
+  background: rgba(120, 120, 140, 0.06);
+}
+/* Past the 48h reminder — the owner has been pinged already. */
+.hermes-kanban-approval-card--stale {
+  border-left-color: var(--hermes-diag-warning, #ff9e3b);
+}
+/* Past the 7d threshold — this will move to the Blocked lane. */
+.hermes-kanban-approval-card--overdue {
+  border-left-color: var(--hermes-diag-critical, #ff4d4d);
+}
+.hermes-kanban-approval-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.hermes-kanban-approval-title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.hermes-kanban-approval-age {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground, #888);
+  white-space: nowrap;
+}
+.hermes-kanban-approval-age--stale {
+  color: var(--hermes-diag-warning, #ff9e3b);
+  font-weight: 600;
+}
+.hermes-kanban-approval-meta {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground, #888);
+}
+
+/* ---------------------------------------------------------------------------
+ * Approval preview — the board.json "drawer_tab": "Preview" section.
+ *
+ * The card body IS the consolidated request; this renders its eight
+ * Stage-8 fields as labelled rows so the owner can weigh each draft
+ * without scrolling prose.
+ * --------------------------------------------------------------------------- */
+.hermes-kanban-approval-draft {
+  padding: 0.4rem 0.75rem;
+  border-top: 1px solid rgba(120, 120, 140, 0.15);
+}
+.hermes-kanban-approval-draft:first-child {
+  border-top: none;
+}
+.hermes-kanban-approval-draft-title {
+  font-weight: 600;
+  font-size: 0.875rem;
+  margin-bottom: 0.2rem;
+}
+.hermes-kanban-approval-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.hermes-kanban-approval-field {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: baseline;
+  font-size: 0.8125rem;
+}
+.hermes-kanban-approval-field-label {
+  color: var(--color-muted-foreground, #888);
+  min-width: 13rem;
+  flex-shrink: 0;
+}
+.hermes-kanban-approval-field-value {
+  flex: 1;
+  min-width: 12rem;
+}
+.hermes-kanban-approval-sublist {
+  flex-basis: 100%;
+  margin: 0.1rem 0 0.3rem 1rem;
+  padding: 0;
+  list-style: disc;
+  font-size: 0.78rem;
+  color: var(--color-muted-foreground, #888);
+}
+.hermes-kanban-approval-sublist li {
+  margin-bottom: 0.1rem;
+}

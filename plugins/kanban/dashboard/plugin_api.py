@@ -10,6 +10,7 @@ dispatcher's write txns); it carries its credential in the query string (browser
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib
 import json
 import logging
@@ -1104,6 +1105,121 @@ def get_config():
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
         "render_markdown": bool(k_cfg.get("render_markdown", True))}
+
+
+# --- GET /approvals --------------------------------------------------------
+# The approval centre (board.json "approval_center"). It lists the cards
+# that are waiting on the OWNER, so the dashboard can show one screen of
+# "what needs my decision" instead of the owner hunting through the board.
+#
+# The card's age is derived from task_events (the newest 'blocked' /
+# 'promoted' / 'unblocked' / 'created' event) — there is no lane timestamp
+# column on `tasks`. A human gate is a card whose block_kind is one of
+# kanban_db.HUMAN_GATE_BLOCK_KINDS.
+
+_APPROVAL_EVENT_KINDS = ("blocked", "promoted", "unblocked", "created")
+
+
+def _approval_cards(conn: sqlite3.Connection, board: Optional[str]) -> list[dict]:
+    """Every card that is waiting on the owner, newest lane entry first."""
+    human_kinds = tuple(getattr(kanban_db, "HUMAN_GATE_BLOCK_KINDS", {"needs_input", "capability"}))
+    rows = conn.execute(
+        "SELECT id, title, body, status, block_kind, created_at, assignee, tenant "
+        "FROM tasks WHERE status = 'blocked' AND block_kind IN (%s) "
+        "ORDER BY created_at DESC"
+        % ",".join("?" * len(human_kinds)),
+        tuple(human_kinds),
+    ).fetchall()
+
+    now = time.time()
+    out: list[dict] = []
+    for row in rows:
+        task_id = row["id"]
+        ev = conn.execute(
+            "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+            "AND kind IN (%s) ORDER BY created_at DESC LIMIT 1"
+            % ",".join("?" * len(_APPROVAL_EVENT_KINDS)),
+            (task_id, *_APPROVAL_EVENT_KINDS),
+        ).fetchone()
+
+        age_seconds = None
+        entered_at = None
+        if ev is not None:
+            entered_at = ev["created_at"]
+            age_seconds = _event_age_seconds(entered_at, now)
+
+        comments = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+
+        out.append({
+            "task_id": task_id,
+            "title": row["title"],
+            "body": row["body"],
+            "status": row["status"],
+            "block_kind": row["block_kind"],
+            "assignee": row["assignee"],
+            "tenant": row["tenant"],
+            "age_seconds": age_seconds,
+            "age_hours": round(age_seconds / 3600, 1) if age_seconds is not None else None,
+            "entered_at": entered_at,
+            "comments": int(comments),
+        })
+    return out
+
+
+def _event_age_seconds(stamp: Any, now: float) -> Optional[float]:
+    """Age of a ``task_events.created_at`` value, in seconds.
+
+    The column is an SQLite datetime string ("YYYY-MM-DD HH:MM:SS", UTC),
+    not a Unix timestamp.
+    """
+    if stamp is None:
+        return None
+    if isinstance(stamp, (int, float)):
+        return max(0.0, now - float(stamp))
+    try:
+        parsed = datetime.datetime.strptime(str(stamp), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except ValueError:
+        return None
+    return max(0.0, now - parsed.timestamp())
+
+
+@router.get("/approvals")
+def get_approvals(board: Optional[str] = _BOARD_Q):
+    """The approval centre: every card waiting on the owner.
+
+    Also returns the cadence config so the UI can show "still waiting"
+    without hard-coding 48h / 7d.
+    """
+    with _board_conn(board) as (resolved, conn):
+        cfg = _approval_center_config(resolved)
+        stale_hours = ((cfg.get("telegram_ping") or {}).get("stale_after_hours")) or 48
+        blocked_days = cfg.get("blocked_after_days") or 7
+        cards = _approval_cards(conn, resolved)
+        return {
+            "board": resolved,
+            "enabled": bool(cfg.get("enabled", True)),
+            "stale_after_hours": stale_hours,
+            "blocked_after_days": blocked_days,
+            "count": len(cards),
+            "cards": cards,
+        }
+
+
+def _approval_center_config(board: Optional[str]) -> dict:
+    """The board's ``approval_center`` block from board.json (config only)."""
+    try:
+        slug = kanban_db._normalize_board_slug(board) if board else kanban_db.get_current_board()
+        path = kanban_db.board_dir(slug) / "board.json"
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("approval_center") or {}
+    except Exception:
+        return {}
 
 
 # --- Home-channel subscriptions (per-task, per-platform toggles) -------------

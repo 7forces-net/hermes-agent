@@ -1285,6 +1285,9 @@
           boardData,
           onOpen: setSelectedTaskId,
         }),
+        h(ApprovalsSection, {
+          boardSlug: board,
+        }),
         h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
@@ -3937,6 +3940,7 @@
         renderMarkdown: props.renderMarkdown,
         onPatch: props.onPatch,
       }),
+      h(ApprovalPreviewSection, { body: t.body }),
       h(DependencyEditor, {
         task: t,
         links, allTasks: props.allTasks,
@@ -4774,6 +4778,236 @@
           }, label);
         })
       )
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Approval preview — the board.json "drawer_tab": "Preview"
+  // -------------------------------------------------------------------------
+  //
+  // An approval card's body IS the consolidated request: the eight Stage-8
+  // fields, one labelled block per draft. The BodyEditor shows that as raw
+  // markdown; this section parses the same text into the eight labelled
+  // fields so the owner can weigh each draft without scrolling prose.
+  //
+  // Parsing the body (rather than a second backend payload) guarantees the
+  // preview and the body can never disagree — there is only one source.
+
+  var APPROVAL_FIELD_LABELS = {
+    1: "Draft title",
+    2: "Article type",
+    3: "Main conclusion",
+    4: "Validation score",
+    5: "Critical findings",
+    6: "Unverified personal statements",
+    7: "Monetization elements",
+    8: "Proposed publication action",
+  };
+
+  function parseApprovalBody(body) {
+    // Returns [{draft_title, fields: {1: "...", ...}, findings: [...],
+    //            statements: [...], monetization: [...]}]
+    if (!body || typeof body !== "string") return [];
+    var drafts = [];
+    var current = null;
+    var lines = body.split(/\r?\n/);
+
+    function flush() {
+      if (current) { drafts.push(current); current = null; }
+    }
+
+    // The list a bullet belongs to, by the field it follows.
+    function listFor(idx) {
+      if (idx === 5) return current.findings;
+      if (idx === 6) return current.statements;
+      if (idx === 7) return current.monetization;
+      return null;
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      // "## 1. Some title" - a new draft block.
+      var h = line.match(/^##\s+(\d+)\.\s+(.*)$/);
+      if (h) {
+        flush();
+        current = { draft_title: h[2].trim(), fields: {}, findings: [], statements: [], monetization: [] };
+        continue;
+      }
+      if (!current) continue;
+      // "**5. Critical findings** - 3 (below). If none: none."
+      var f = line.match(/^\*\*(\d)\.\s+([^*]+)\*\*\s*(?:\u2014|-|:)?\s*(.*)$/);
+      if (f) {
+        var idx = parseInt(f[1], 10);
+        current.fields[idx] = { label: (APPROVAL_FIELD_LABELS[idx] || f[2]).trim(), value: (f[3] || "").trim() };
+        continue;
+      }
+      // Bullets belong to the last field. A TOP-LEVEL bullet is a new item
+      // in that field's list; an INDENTED bullet is a detail of the item
+      // above it (the finding's detail / fix / source lines).
+      var lastIdx = null;
+      for (var k = 8; k >= 1; k--) { if (current.fields[k]) { lastIdx = k; break; } }
+      if (!lastIdx) continue;
+      var b = line.match(/^(\s*)[-*]\s+(.*)$/);
+      if (!b) continue;
+      var list = listFor(lastIdx);
+      if (!list) continue;
+      if (b[1].length === 0) {
+        list.push({ text: b[2], details: [] });
+      } else if (list.length) {
+        list[list.length - 1].details.push(b[2]);
+      }
+    }
+    flush();
+    return drafts;
+  }
+
+  function ApprovalPreviewSection(props) {
+    const { t } = useI18n();
+    const body = props.body || "";
+    const drafts = parseApprovalBody(body);
+    if (!drafts.length) return null;
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" },
+        tx(t, "approvalPreview", "Approval preview")),
+      drafts.map(function (d, di) {
+        return h("div", { key: "appr-" + di, className: "hermes-kanban-approval-draft" },
+          h("div", { className: "hermes-kanban-approval-draft-title" }, d.draft_title),
+          h("div", { className: "hermes-kanban-approval-fields" },
+            [1, 2, 3, 4, 5, 6, 7, 8].map(function (n) {
+              var f = d.fields[n];
+              if (!f) return null;
+              var extra = null;
+              var items = null;
+              if (n === 5) items = d.findings;
+              else if (n === 6) items = d.statements;
+              else if (n === 7) items = d.monetization;
+              if (items && items.length) {
+                extra = h("ul", { className: "hermes-kanban-approval-sublist" },
+                  items.map(function (x, xi) {
+                    var kids = null;
+                    if (x.details && x.details.length) {
+                      kids = h("ul", { className: "hermes-kanban-approval-sublist" },
+                        x.details.map(function (dy, di2) {
+                          return h("li", { key: di2 }, dy);
+                        }));
+                    }
+                    return h("li", { key: xi }, x.text, kids);
+                  }));
+              }
+              return h("div", { key: n, className: "hermes-kanban-approval-field" },
+                h("span", { className: "hermes-kanban-approval-field-label" },
+                  `${n}. ${f.label}`),
+                h("span", { className: "hermes-kanban-approval-field-value" }, f.value),
+                extra);
+            }),
+          ),
+        );
+      }),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Approvals — the approval centre
+  // -------------------------------------------------------------------------
+  //
+  // The board's "approval_center" (board.json) declares an approval centre
+  // with a 48h "still waiting" ping and a 7d move-to-Blocked. This section
+  // is the visible half of it: ONE list of everything waiting on the owner,
+  // with how long each item has been waiting and what it is blocked on.
+  //
+  // The age comes from the backend (derived from task_events — there is no
+  // lane-timestamp column), so the numbers here and the numbers the
+  // cadence acts on can never disagree.
+
+  function ApprovalsSection(props) {
+    const { t } = useI18n();
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [err, setErr] = useState(null);
+    const boardSlug = props.boardSlug;
+
+    const load = useCallback(function () {
+      let cancelled = false;
+      setLoading(true);
+      SDK.fetchJSON(withBoard(`${API}/approvals`, boardSlug))
+        .then(function (d) {
+          if (cancelled) return;
+          setData(d);
+          setErr(null);
+        })
+        .catch(function (e) {
+          if (cancelled) return;
+          setErr(String((e && e.message) || e));
+        })
+        .finally(function () {
+          if (!cancelled) setLoading(false);
+        });
+      return function () { cancelled = true; };
+    }, [boardSlug]);
+
+    useEffect(load, [load]);
+
+    const cards = (data && data.cards) || [];
+    const staleHours = (data && data.stale_after_hours) || 48;
+    const blockedDays = (data && data.blocked_after_days) || 7;
+
+    if (loading && !data) {
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" },
+          tx(t, "approvals", "Approvals") + " — " + tx(t, "loading", "Loading")));
+    }
+    if (err) {
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" },
+          tx(t, "approvals", "Approvals")),
+        h("div", { className: "hermes-kanban-msg-err" }, err));
+    }
+    if (!cards.length) {
+      return null; // Nothing waiting on the owner — keep the board clean.
+    }
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("span", { className: "hermes-kanban-section-head" },
+          tx(t, "approvals", "Approvals") + ` (${cards.length})`),
+        h("button", {
+          className: "hermes-kanban-section-toggle",
+          onClick: load,
+          type: "button",
+        }, tx(t, "refresh", "Refresh")),
+      ),
+      h("div", { className: "hermes-kanban-approval-list" },
+        cards.map(function (c) {
+          const hours = c.age_hours === null || c.age_hours === undefined ? null : Number(c.age_hours);
+          const stale = hours !== null && hours >= staleHours;
+          const overdue = hours !== null && hours >= blockedDays * 24;
+          const ageLabel = hours === null
+            ? "?"
+            : (hours < 48 ? Math.round(hours) + "h" : Math.round(hours / 24) + "d");
+          return h("div", {
+            key: c.task_id,
+            className: "hermes-kanban-approval-card"
+              + (overdue ? " hermes-kanban-approval-card--overdue" : "")
+              + (stale && !overdue ? " hermes-kanban-approval-card--stale" : ""),
+          },
+            h("div", { className: "hermes-kanban-approval-head" },
+              h("span", { className: "hermes-kanban-approval-title" }, c.title || c.task_id),
+              h("span", {
+                className: "hermes-kanban-approval-age"
+                  + (stale ? " hermes-kanban-approval-age--stale" : ""),
+                title: overdue
+                  ? `Waiting ${ageLabel} — past the ${blockedDays}-day threshold`
+                  : (stale ? `Waiting ${ageLabel} — the ${staleHours}h reminder is due` : `Waiting ${ageLabel}`),
+              }, ageLabel)),
+            h("div", { className: "hermes-kanban-approval-meta" },
+              h("code", null, c.task_id),
+              c.tenant ? h("span", null, " · " + c.tenant) : null,
+              c.assignee ? h("span", null, " · " + c.assignee) : null,
+              c.comments ? h("span", null, ` · ${c.comments} ${tx(t, "comments", "comments")}`) : null),
+          );
+        }),
+      ),
     );
   }
 
