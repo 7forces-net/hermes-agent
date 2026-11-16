@@ -1096,6 +1096,39 @@ def _load_config_or_empty() -> dict:
         return {}
 
 
+def _dispatch_host_cap() -> Optional[int]:
+    """Resolve the HOST-level concurrency cap for a manual dispatch nudge.
+
+    Mirrors ``hermes kanban dispatch`` (``hermes_cli/kanban_ops.py``): the
+    explicit ``kanban.max_in_progress`` wins; when it is unset the
+    memory-derived default applies; when memory cannot be read the cap is
+    None and only the per-board ``max_spawn`` bounds the tick.
+
+    This must NEVER be dropped from a dispatch call site. ``_tick_spawn_budget``
+    only evaluates the host cap when ``max_in_progress`` is not None, so a
+    caller that omits it silently opts out of the guard that keeps a small
+    machine from being swamped by agent processes.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = (load_config() or {}).get("kanban", {}) or {}
+        configured = kanban_cfg.get("max_in_progress")
+        if configured is not None:
+            try:
+                value = int(configured)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value >= 1:
+                return value
+        return kbd.resolve_max_in_progress(None)
+    except Exception:
+        try:
+            return kbd.resolve_max_in_progress(None)
+        except Exception:
+            return None
+
+
 @router.get("/config")
 def get_config():
     """Kanban dashboard preferences from the ``dashboard.kanban`` config section."""
@@ -1333,9 +1366,28 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
-    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
+
+    The nudge is an operator affordance, NOT a second dispatcher: it must obey
+    the SAME concurrency caps as the gateway tick and ``hermes kanban dispatch``.
+    Measured incident (2026-11-16, board ``techdad``): this endpoint called
+    ``dispatch_once`` with ``max_spawn=8`` and ``max_in_progress=None``, so the
+    configured HOST cap (``kanban.max_in_progress: 3``) was never evaluated.
+    ``_tick_spawn_budget`` only enforces that cap when ``max_in_progress`` is
+    not None, so a single click spawned 5 extra workers on top of the 3 that
+    were already running -- 8 full agent processes on a host with <1 GB free
+    RAM. The host cap is what protects a small machine, so it is resolved from
+    config here exactly as the CLI does it.
+    """
+    max_in_progress = _dispatch_host_cap()
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_in_progress=max_in_progress,
+            board=board,
+        )
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

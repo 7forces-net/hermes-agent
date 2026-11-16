@@ -874,6 +874,7 @@ def _do_dispatch(conn, report: WatchdogReport, settings: WatchdogSettings) -> No
         result = kbd.dispatch_once(
             conn,
             max_spawn=settings.max_dispatch,
+            max_in_progress=kbd.resolve_max_in_progress(kbd.configured_max_in_progress()),
             board=report.board or None,
         )
         report.dispatched.extend(tid for tid, _who, _ws in result.spawned)
